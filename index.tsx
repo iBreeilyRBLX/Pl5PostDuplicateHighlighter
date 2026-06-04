@@ -7,21 +7,56 @@
 import { NavContextMenuPatchCallback } from "@api/ContextMenu";
 import { definePluginSettings } from "@api/Settings";
 import definePlugin, { OptionType } from "@utils/types";
-import { ChannelRouter, ChannelStore, createRoot, Menu, MessageStore, React, SelectedChannelStore, useStateFromStores } from "@webpack/common";
+import { ChannelRouter, ChannelStore, createRoot, InviteActions, Menu, MessageStore, React, SelectedChannelStore, useStateFromStores } from "@webpack/common";
 import type { Root } from "react-dom/client";
 
-const TARGET_GUILD_ID = "553917324340625424";
-const TARGET_FORUM_CHANNEL_ID = "1210394762268643328";
-const DEFAULT_DUPLICATE_COLOR = 0xff6b6b;
-const DEFAULT_UNIQUE_COLOR = 0x4ade80;
-const DEFAULT_DUPLICATE_WINDOW_MINUTES = 720;
-const MIN_DUPLICATE_WINDOW_MINUTES = 1;
-const MAX_DUPLICATE_WINDOW_MINUTES = 10080;
-const FALLBACK_SIMILARITY_THRESHOLD = 75;
-const DISCORD_INVITE_RE = /(?:https?:\/\/)?(?:www\.)?(?:discord\.gg|discord(?:app)?\.com\/invite)\/([a-zA-Z0-9-]+)/i;
-const SNOWFLAKE_RE = /\d{17,20}/g;
+import trackedGuildList from "./trackedGuilds.json";
 
-type HighlightState = "duplicate" | "unique";
+const FIXED_IDS = {
+    guildId: "553917324340625424",
+    forumChannelId: "1210394762268643328",
+} as const;
+
+const COLORS = {
+    duplicate: 0xff6b6b,
+    duplicateWarning: 0xfacc15,
+    unique: 0x4ade80,
+    targetInviteGuild: 0x00e5ff,
+} as const;
+
+const LIMITS = {
+    duplicateWindowMinutes: {
+        default: 720,
+        min: 1,
+        max: 10080,
+    },
+    warningDuplicateThresholdMinutes: {
+        default: 3,
+        min: 1,
+        max: 1440,
+    },
+    trackedListRefreshMinutes: {
+        default: 15,
+        min: 1,
+        max: 1440,
+    },
+} as const;
+
+const FALLBACKS = {
+    similarityThreshold: 75,
+    targetInviteGuildIds: normalizeGuildIds(trackedGuildList?.guildIds),
+} as const;
+
+const CACHE_KEYS = {
+    trackedGuildList: "vc-pl5-tracked-guild-list-v1",
+} as const;
+
+const PATTERNS = {
+    discordInvite: /(?:https?:\/\/)?(?:www\.)?(?:discord\.gg|discord(?:app)?\.com\/invite)\/([a-zA-Z0-9-]+)/i,
+    snowflake: /\d{17,20}/g,
+} as const;
+
+type HighlightState = "duplicate" | "unique" | "targetInviteGuild";
 type MatchReason = "title" | "invite" | "content";
 
 interface ThreadRecord {
@@ -29,6 +64,7 @@ interface ThreadRecord {
     createdAt: number;
     title: string;
     inviteCode: string;
+    inviteGuildId: string;
     contentSnippet: string;
     highlight: HighlightState;
     duplicateUntil: number | null;
@@ -68,6 +104,12 @@ interface RecordSummary {
     title: string;
 }
 
+interface TrackedGuildListCache {
+    guildIds: string[];
+    updatedAt: number;
+    sourceUrl: string;
+}
+
 const settings = definePluginSettings({
     enabled: {
         type: OptionType.BOOLEAN,
@@ -79,15 +121,49 @@ const settings = definePluginSettings({
         default: true,
         description: "Apply green tint to unique posts",
     },
+    trackedGuildListUrl: {
+        type: OptionType.STRING,
+        default: "https://raw.githubusercontent.com/iBreeilyRBLX/Pl5PostDuplicateHighlighter/refs/heads/master/trackedGuilds.json",
+        placeholder: "https://raw.githubusercontent.com/<owner>/<repo>/<branch>/trackedGuilds.json",
+        description: "Optional URL to fetch tracked invite (Blacklisted Factions) guild IDs (falls back to bundled list if unavailable)",
+    },
+    trackedGuildListRefreshMinutes: {
+        type: OptionType.NUMBER,
+        default: LIMITS.trackedListRefreshMinutes.default,
+        description: "How often to refresh tracked invite guild IDs from URL (minutes)",
+        isValid(value: number) {
+            const numericValue = Number(value);
+            if (!Number.isFinite(numericValue)) return "Enter a valid number of minutes";
+            if (numericValue < LIMITS.trackedListRefreshMinutes.min || numericValue > LIMITS.trackedListRefreshMinutes.max) {
+                return `Value must be between ${LIMITS.trackedListRefreshMinutes.min} and ${LIMITS.trackedListRefreshMinutes.max} minutes`;
+            }
+
+            return true;
+        },
+    },
+    warningDuplicateThresholdMinutes: {
+        type: OptionType.NUMBER,
+        default: LIMITS.warningDuplicateThresholdMinutes.default,
+        description: "When duplicate expiry is within this many minutes, use warning color",
+        isValid(value: number) {
+            const numericValue = Number(value);
+            if (!Number.isFinite(numericValue)) return "Enter a valid number of minutes";
+            if (numericValue < LIMITS.warningDuplicateThresholdMinutes.min || numericValue > LIMITS.warningDuplicateThresholdMinutes.max) {
+                return `Value must be between ${LIMITS.warningDuplicateThresholdMinutes.min} and ${LIMITS.warningDuplicateThresholdMinutes.max} minutes`;
+            }
+
+            return true;
+        },
+    },
     duplicateWindowMinutes: {
         type: OptionType.NUMBER,
-        default: DEFAULT_DUPLICATE_WINDOW_MINUTES,
+        default: LIMITS.duplicateWindowMinutes.default,
         description: "Duplicate window in minutes (type a value, e.g. 720)",
         isValid(value: number) {
             const numericValue = Number(value);
             if (!Number.isFinite(numericValue)) return "Enter a valid number of minutes";
-            if (numericValue < MIN_DUPLICATE_WINDOW_MINUTES || numericValue > MAX_DUPLICATE_WINDOW_MINUTES) {
-                return `Value must be between ${MIN_DUPLICATE_WINDOW_MINUTES} and ${MAX_DUPLICATE_WINDOW_MINUTES} minutes`;
+            if (numericValue < LIMITS.duplicateWindowMinutes.min || numericValue > LIMITS.duplicateWindowMinutes.max) {
+                return `Value must be between ${LIMITS.duplicateWindowMinutes.min} and ${LIMITS.duplicateWindowMinutes.max} minutes`;
             }
 
             return true;
@@ -128,7 +204,7 @@ const settings = definePluginSettings({
     similarityThreshold: {
         type: OptionType.SLIDER,
         markers: [50, 60, 70, 75, 80, 90, 100],
-        default: FALLBACK_SIMILARITY_THRESHOLD,
+        default: FALLBACKS.similarityThreshold,
         stickToMarkers: true,
         description: "Minimum similarity percentage required for content matches",
     },
@@ -159,8 +235,15 @@ let renderedRecords = new Map<string, ThreadRecord>();
 let duplicateHistory: DuplicateHistoryEntry[] = [];
 let duplicateHistorySignature = "";
 const duplicateHistoryListeners = new Set<() => void>();
-const postTextCache = new Map<string, { firstMessageId: string; content: string; inviteCode: string; }>();
+const postTextCache = new Map<string, { firstMessageId: string; content: string; inviteCode: string; inviteGuildId: string; }>();
+const inviteGuildIdCache = new Map<string, string | null>();
+const resolvingInviteCodes = new Set<string>();
 const similarityCache = new Map<string, number>();
+const trackedInviteGuildIds = new Set(FALLBACKS.targetInviteGuildIds);
+let trackedGuildListRefreshTimer: number | null = null;
+let trackedGuildListLastSource: "remote" | "cache" | "fallback" = "fallback";
+let trackedGuildListLastUpdatedAt = 0;
+let trackedGuildListFetchInFlight = false;
 let excludeRegexCacheSource = "";
 let excludeRegexCache: RegExp | null = null;
 
@@ -253,15 +336,15 @@ function formatMatchReasons(reasons: MatchReason[], contentSimilarity: number | 
 }
 
 function getSimilarityThreshold() {
-    const threshold = Number(settings.store.similarityThreshold) || FALLBACK_SIMILARITY_THRESHOLD;
+    const threshold = Number(settings.store.similarityThreshold) || FALLBACKS.similarityThreshold;
     return Math.min(100, Math.max(0, threshold)) / 100;
 }
 
 function getDuplicateWindowMs() {
     const minutes = Number(settings.store.duplicateWindowMinutes);
     const safeMinutes = Number.isFinite(minutes)
-        ? Math.min(MAX_DUPLICATE_WINDOW_MINUTES, Math.max(MIN_DUPLICATE_WINDOW_MINUTES, minutes))
-        : DEFAULT_DUPLICATE_WINDOW_MINUTES;
+        ? Math.min(LIMITS.duplicateWindowMinutes.max, Math.max(LIMITS.duplicateWindowMinutes.min, minutes))
+        : LIMITS.duplicateWindowMinutes.default;
 
     return safeMinutes * 60 * 1000;
 }
@@ -275,8 +358,213 @@ function normalizeContent(content: string) {
 }
 
 function extractInviteCode(content: string) {
-    const inviteMatch = content.match(DISCORD_INVITE_RE);
+    const inviteMatch = content.match(PATTERNS.discordInvite);
     return inviteMatch?.[1].toLowerCase() ?? "";
+}
+
+function normalizeGuildIds(rawIds: unknown) {
+    if (!Array.isArray(rawIds)) return [];
+
+    const seen = new Set<string>();
+    for (const value of rawIds) {
+        const guildId = String(value ?? "").trim();
+        if (!/^\d{17,20}$/.test(guildId)) continue;
+        seen.add(guildId);
+    }
+
+    return [...seen];
+}
+
+function setTrackedInviteGuildIds(guildIds: string[], source: "remote" | "cache" | "fallback", updatedAt = Date.now()) {
+    const normalized = normalizeGuildIds(guildIds);
+    const nextIds = normalized.length ? normalized : [...FALLBACKS.targetInviteGuildIds];
+    const previousSignature = [...trackedInviteGuildIds].sort().join("|");
+    const nextSignature = [...nextIds].sort().join("|");
+
+    trackedInviteGuildIds.clear();
+    for (const guildId of nextIds) {
+        trackedInviteGuildIds.add(guildId);
+    }
+
+    trackedGuildListLastSource = source;
+    trackedGuildListLastUpdatedAt = updatedAt;
+
+    if (previousSignature !== nextSignature) {
+        logDebug("Tracked guild list updated", {
+            source,
+            count: trackedInviteGuildIds.size,
+            sample: [...trackedInviteGuildIds].slice(0, 5),
+        });
+        scheduleRefresh();
+    }
+}
+
+function readTrackedGuildListCache() {
+    try {
+        const raw = localStorage.getItem(CACHE_KEYS.trackedGuildList);
+        if (!raw) return null;
+
+        const parsed = JSON.parse(raw) as TrackedGuildListCache;
+        if (!parsed || typeof parsed !== "object") return null;
+
+        const sourceUrl = typeof parsed.sourceUrl === "string" ? parsed.sourceUrl : "";
+        const updatedAt = Number(parsed.updatedAt);
+        const guildIds = normalizeGuildIds(parsed.guildIds);
+        if (!sourceUrl || !guildIds.length) return null;
+
+        return {
+            sourceUrl,
+            updatedAt: Number.isFinite(updatedAt) ? updatedAt : Date.now(),
+            guildIds,
+        } as TrackedGuildListCache;
+    } catch {
+        return null;
+    }
+}
+
+function writeTrackedGuildListCache(cache: TrackedGuildListCache) {
+    try {
+        localStorage.setItem(CACHE_KEYS.trackedGuildList, JSON.stringify(cache));
+    } catch {
+        // Ignore storage failures.
+    }
+}
+
+function getTrackedGuildListUrl() {
+    return String(settings.store.trackedGuildListUrl ?? "").trim();
+}
+
+function getTrackedGuildListRefreshMs() {
+    const minutes = Number(settings.store.trackedGuildListRefreshMinutes);
+    const safeMinutes = Number.isFinite(minutes)
+        ? Math.min(LIMITS.trackedListRefreshMinutes.max, Math.max(LIMITS.trackedListRefreshMinutes.min, minutes))
+        : LIMITS.trackedListRefreshMinutes.default;
+
+    return safeMinutes * 60 * 1000;
+}
+
+function getWarningDuplicateThresholdMs() {
+    const minutes = Number(settings.store.warningDuplicateThresholdMinutes);
+    const safeMinutes = Number.isFinite(minutes)
+        ? Math.min(LIMITS.warningDuplicateThresholdMinutes.max, Math.max(LIMITS.warningDuplicateThresholdMinutes.min, minutes))
+        : LIMITS.warningDuplicateThresholdMinutes.default;
+
+    return safeMinutes * 60 * 1000;
+}
+
+async function refreshTrackedGuildListFromRemote() {
+    if (trackedGuildListFetchInFlight) return;
+
+    const url = getTrackedGuildListUrl();
+    if (!url) {
+        setTrackedInviteGuildIds(FALLBACKS.targetInviteGuildIds, "fallback");
+        return;
+    }
+
+    trackedGuildListFetchInFlight = true;
+    try {
+        const response = await fetch(url, {
+            cache: "no-store",
+        });
+
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+
+        const payload = await response.json();
+        const fromObject = payload?.guildIds;
+        const guildIds = normalizeGuildIds(Array.isArray(payload) ? payload : fromObject);
+        if (!guildIds.length) {
+            throw new Error("Remote list was empty or invalid");
+        }
+
+        const updatedAt = Date.now();
+        setTrackedInviteGuildIds(guildIds, "remote", updatedAt);
+        writeTrackedGuildListCache({
+            sourceUrl: url,
+            updatedAt,
+            guildIds,
+        });
+    } catch (error) {
+        logDebug("Failed to refresh tracked guild list", {
+            error,
+            source: trackedGuildListLastSource,
+            cachedCount: trackedInviteGuildIds.size,
+        });
+
+        if (!trackedInviteGuildIds.size) {
+            setTrackedInviteGuildIds(FALLBACKS.targetInviteGuildIds, "fallback");
+        }
+    } finally {
+        trackedGuildListFetchInFlight = false;
+    }
+}
+
+function initializeTrackedGuildList() {
+    const url = getTrackedGuildListUrl();
+    if (!url) {
+        setTrackedInviteGuildIds(FALLBACKS.targetInviteGuildIds, "fallback");
+        return;
+    }
+
+    const cache = readTrackedGuildListCache();
+    if (cache && cache.sourceUrl === url) {
+        setTrackedInviteGuildIds(cache.guildIds, "cache", cache.updatedAt);
+    } else {
+        setTrackedInviteGuildIds(FALLBACKS.targetInviteGuildIds, "fallback");
+    }
+
+    void refreshTrackedGuildListFromRemote();
+}
+
+function attachTrackedGuildListRefresh() {
+    detachTrackedGuildListRefresh();
+
+    const url = getTrackedGuildListUrl();
+    if (!url) return;
+
+    trackedGuildListRefreshTimer = window.setInterval(() => {
+        void refreshTrackedGuildListFromRemote();
+    }, getTrackedGuildListRefreshMs());
+}
+
+function detachTrackedGuildListRefresh() {
+    if (trackedGuildListRefreshTimer != null) {
+        clearInterval(trackedGuildListRefreshTimer);
+        trackedGuildListRefreshTimer = null;
+    }
+}
+
+function isTargetInviteGuild(guildId: string) {
+    return guildId ? trackedInviteGuildIds.has(guildId) : false;
+}
+
+function scheduleInviteGuildResolution(inviteCode: string) {
+    const normalizedCode = inviteCode.toLowerCase();
+    if (!normalizedCode) return;
+    if (inviteGuildIdCache.has(normalizedCode) || resolvingInviteCodes.has(normalizedCode)) return;
+
+    resolvingInviteCodes.add(normalizedCode);
+    void InviteActions.resolveInvite(normalizedCode, "Pl5PostDuplicateHighlighter")
+        .then((result: any) => {
+            const guildId = result?.invite?.guild?.id;
+            inviteGuildIdCache.set(normalizedCode, typeof guildId === "string" ? guildId : null);
+        })
+        .catch(() => {
+            inviteGuildIdCache.set(normalizedCode, null);
+        })
+        .finally(() => {
+            resolvingInviteCodes.delete(normalizedCode);
+
+            const resolvedGuildId = inviteGuildIdCache.get(normalizedCode) ?? "";
+            for (const cached of postTextCache.values()) {
+                if (cached.inviteCode === normalizedCode) {
+                    cached.inviteGuildId = resolvedGuildId;
+                }
+            }
+
+            scheduleRefresh();
+        });
 }
 
 function snowflakeToTimestamp(id: string) {
@@ -332,8 +620,26 @@ function hexToRgba(hexColor: number, alpha: number) {
     return `rgba(${red}, ${green}, ${blue}, ${alpha})`;
 }
 
-function getConfiguredColor(kind: HighlightState) {
-    return kind === "duplicate" ? DEFAULT_DUPLICATE_COLOR : DEFAULT_UNIQUE_COLOR;
+function getHighlightColor(record: ThreadRecord) {
+    if (record.highlight === "targetInviteGuild") {
+        return COLORS.targetInviteGuild;
+    }
+
+    if (record.highlight !== "duplicate") {
+        return COLORS.unique;
+    }
+
+    const windowMs = getDuplicateWindowMs();
+    const warningThresholdMs = getWarningDuplicateThresholdMs();
+    const timeUntilUnique = record.matchedPreviousDeltaMs == null
+        ? null
+        : Math.max(0, windowMs - record.matchedPreviousDeltaMs);
+
+    if (timeUntilUnique != null && timeUntilUnique <= warningThresholdMs) {
+        return COLORS.duplicateWarning;
+    }
+
+    return COLORS.duplicate;
 }
 
 function parseThreadIdFromHref(href: string) {
@@ -354,13 +660,13 @@ function parseThreadIdFromHref(href: string) {
     const second = match[2];
     const third = match[3];
 
-    if (guildId !== TARGET_GUILD_ID) return null;
-    if (second === TARGET_FORUM_CHANNEL_ID) return third ?? null;
+    if (guildId !== FIXED_IDS.guildId) return null;
+    if (second === FIXED_IDS.forumChannelId) return third ?? null;
     return second ?? null;
 }
 
 function extractKnownThreadIdFromText(value: string) {
-    const ids = value.match(SNOWFLAKE_RE) ?? [];
+    const ids = value.match(PATTERNS.snowflake) ?? [];
     for (const id of ids) {
         if (renderedRecords.has(id)) return id;
     }
@@ -400,38 +706,51 @@ function isInTargetForumContext() {
     const selectedChannelId = SelectedChannelStore.getChannelId();
     if (!selectedChannelId) return false;
 
-    if (selectedChannelId === TARGET_FORUM_CHANNEL_ID) return true;
+    if (selectedChannelId === FIXED_IDS.forumChannelId) return true;
 
     const selectedChannel = ChannelStore.getChannel(selectedChannelId);
     if (!selectedChannel?.isForumPost?.()) return false;
-    return selectedChannel.parent_id === TARGET_FORUM_CHANNEL_ID && selectedChannel.getGuildId() === TARGET_GUILD_ID;
+    return selectedChannel.parent_id === FIXED_IDS.forumChannelId && selectedChannel.getGuildId() === FIXED_IDS.guildId;
 }
 
 function getPostText(channelId: string) {
     const message = getFirstForumMessage(channelId);
     if (!message) {
-        return { content: "", inviteCode: "" };
+        return { content: "", inviteCode: "", inviteGuildId: "" };
     }
 
     const cached = postTextCache.get(channelId);
     if (cached && cached.firstMessageId === message.id) {
+        if (cached.inviteCode && !cached.inviteGuildId && inviteGuildIdCache.has(cached.inviteCode)) {
+            cached.inviteGuildId = inviteGuildIdCache.get(cached.inviteCode) ?? "";
+        }
+
         return {
             content: cached.content,
             inviteCode: cached.inviteCode,
+            inviteGuildId: cached.inviteGuildId,
         };
     }
 
     const content = typeof message.content === "string" ? message.content : "";
     const inviteCode = extractInviteCode(content);
+    const inviteGuildId = inviteCode ? (inviteGuildIdCache.get(inviteCode) ?? "") : "";
+
+    if (inviteCode && !inviteGuildIdCache.has(inviteCode)) {
+        scheduleInviteGuildResolution(inviteCode);
+    }
+
     postTextCache.set(channelId, {
         firstMessageId: message.id,
         content,
         inviteCode,
+        inviteGuildId,
     });
 
     return {
         content,
         inviteCode,
+        inviteGuildId,
     };
 }
 
@@ -632,8 +951,8 @@ function applyExpiryTooltip(element: HTMLElement, record: ThreadRecord) {
 
 function buildThreadRecords() {
     const windowMs = getDuplicateWindowMs();
-    const threads = ChannelStore.getAllThreadsForParent(TARGET_FORUM_CHANNEL_ID)
-        .filter(channel => channel?.isForumPost?.() && channel.getGuildId() === TARGET_GUILD_ID)
+    const threads = ChannelStore.getAllThreadsForParent(FIXED_IDS.forumChannelId)
+        .filter(channel => channel?.isForumPost?.() && channel.getGuildId() === FIXED_IDS.guildId)
         .sort((left, right) => getThreadCreatedAt(left) - getThreadCreatedAt(right));
 
     const activeRecords: ThreadRecord[] = [];
@@ -653,6 +972,7 @@ function buildThreadRecords() {
             createdAt,
             title: normalizeTitle(thread.name ?? ""),
             inviteCode: "",
+            inviteGuildId: "",
             contentSnippet: "",
             highlight: "unique",
             duplicateUntil: null,
@@ -665,9 +985,18 @@ function buildThreadRecords() {
             excludedByPattern: false,
         };
 
-        const { content, inviteCode } = getPostText(thread.id);
+        const { content, inviteCode, inviteGuildId } = getPostText(thread.id);
         record.inviteCode = inviteCode;
+        record.inviteGuildId = inviteGuildId;
         record.contentSnippet = normalizeContent(content);
+
+        if (isTargetInviteGuild(record.inviteGuildId)) {
+            record.highlight = "targetInviteGuild";
+            nextRecords.set(thread.id, record);
+            previousRecords.push(record);
+            activeRecords.push(record);
+            continue;
+        }
 
         const excludeRegex = getExcludeRegex();
         if (excludeRegex && (excludeRegex.test(record.title) || excludeRegex.test(record.contentSnippet))) {
@@ -729,6 +1058,7 @@ function buildThreadRecords() {
                 highlight: r.highlight,
                 title: r.title,
                 inviteCode: r.inviteCode,
+                inviteGuildId: r.inviteGuildId,
                 contentSnippet: r.contentSnippet,
             }));
             logDebug("recordSample", sample);
@@ -807,9 +1137,11 @@ function applyHighlightToCard(element: HTMLElement, record: ThreadRecord) {
         return;
     }
 
-    const color = getConfiguredColor(record.highlight);
+    const color = getHighlightColor(record);
     const rgb = `#${color.toString(16).padStart(6, "0")}`;
-    const translucent = hexToRgba(color, 0.12);
+    const translucent = record.highlight === "targetInviteGuild"
+        ? hexToRgba(color, 0.28)
+        : hexToRgba(color, 0.12);
 
     element.dataset.vcPl5PostDuplicateHighlighter = record.highlight;
     setCardStyle(element, "background-color", translucent);
@@ -903,6 +1235,9 @@ function refreshHighlights() {
         () => logDebug("enabled", settings.store.enabled),
         () => logDebug("inTargetForumContext", isInTargetForumContext()),
         () => logDebug("tintUniquePosts", settings.store.tintUniquePosts),
+        () => logDebug("trackedGuildListSource", trackedGuildListLastSource),
+        () => logDebug("trackedGuildListUpdatedAt", trackedGuildListLastUpdatedAt),
+        () => logDebug("trackedGuildCount", trackedInviteGuildIds.size),
         () => logDebug("renderedRecords", renderedRecords.size),
         () => logDebug("applied", applied),
         () => logDebug("cleared", cleared),
@@ -964,6 +1299,9 @@ function detachHeartbeat() {
 function Driver() {
     settings.use([
         "enabled",
+        "trackedGuildListUrl",
+        "trackedGuildListRefreshMinutes",
+        "warningDuplicateThresholdMinutes",
         "duplicateWindowMinutes",
         "excludePatternRegex",
         "checkTitle",
@@ -978,8 +1316,8 @@ function Driver() {
     useStateFromStores(
         [ChannelStore, MessageStore, SelectedChannelStore],
         () => {
-            const threads = ChannelStore.getAllThreadsForParent(TARGET_FORUM_CHANNEL_ID)
-                .filter(channel => channel?.isForumPost?.() && channel.getGuildId() === TARGET_GUILD_ID);
+            const threads = ChannelStore.getAllThreadsForParent(FIXED_IDS.forumChannelId)
+                .filter(channel => channel?.isForumPost?.() && channel.getGuildId() === FIXED_IDS.guildId);
             const selected = SelectedChannelStore.getChannelId() ?? "";
             return `${selected}|${threads.map(thread => `${thread.id}:${thread.lastMessageId ?? ""}:${thread.messageCount ?? 0}:${MessageStore.getMessages(thread.id)?._array.length ?? 0}`).join("|")}`;
         },
@@ -991,6 +1329,15 @@ function Driver() {
         logDebug("Driver effect scheduleRefresh()");
         scheduleRefresh();
     }, []);
+
+    React.useEffect(() => {
+        initializeTrackedGuildList();
+        attachTrackedGuildListRefresh();
+        return () => detachTrackedGuildListRefresh();
+    }, [
+        settings.store.trackedGuildListUrl,
+        settings.store.trackedGuildListRefreshMinutes,
+    ]);
 
     return null;
 }
@@ -1019,7 +1366,7 @@ const patchThreadContextMenu: NavContextMenuPatchCallback = (children, { channel
 
     const thread = channel ?? null;
     if (!thread?.id || !thread?.isForumPost?.()) return;
-    if (thread.parent_id !== TARGET_FORUM_CHANNEL_ID || thread.getGuildId() !== TARGET_GUILD_ID) return;
+    if (thread.parent_id !== FIXED_IDS.forumChannelId || thread.getGuildId() !== FIXED_IDS.guildId) return;
 
     const record = renderedRecords.get(thread.id);
     if (!record?.duplicateSourceThreadId) return;
@@ -1062,6 +1409,7 @@ export default definePlugin({
         logDebug("stop()");
         detachObserver();
         detachHeartbeat();
+        detachTrackedGuildListRefresh();
         unmountDriver();
 
         for (const element of document.querySelectorAll<HTMLElement>("[data-vc-pl5-post-duplicate-highlighter]")) {
@@ -1070,6 +1418,8 @@ export default definePlugin({
 
         renderedRecords.clear();
         postTextCache.clear();
+        inviteGuildIdCache.clear();
+        resolvingInviteCodes.clear();
         similarityCache.clear();
         duplicateHistory = [];
         duplicateHistorySignature = "";
