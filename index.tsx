@@ -40,6 +40,15 @@ const LIMITS = {
         min: 1,
         max: 1440,
     },
+    maxConcurrentInviteResolutions: 4,
+    inviteResolutionRetry: {
+        // Exponential backoff for failed invite resolutions (expired/invalid invite,
+        // transient network error, Discord API rate limit, etc). Previously a single
+        // failure permanently marked a post as "not a target guild" for the rest of
+        // the session; this lets it keep retrying at an increasing interval instead.
+        baseMs: 10_000,
+        maxMs: 5 * 60_000,
+    },
 } as const;
 
 const FALLBACKS = {
@@ -236,8 +245,17 @@ let duplicateHistory: DuplicateHistoryEntry[] = [];
 let duplicateHistorySignature = "";
 const duplicateHistoryListeners = new Set<() => void>();
 const postTextCache = new Map<string, { firstMessageId: string; content: string; inviteCode: string; inviteGuildId: string; }>();
-const inviteGuildIdCache = new Map<string, string | null>();
-const resolvingInviteCodes = new Set<string>();
+// Only ever holds CONFIRMED resolutions (a real guild id, or "" for "resolved, no guild").
+// Codes that are pending, queued, or have failed and are awaiting retry are intentionally
+// absent from this map so callers can tell "not yet known" apart from "confirmed empty".
+const inviteGuildIdCache = new Map<string, string>();
+// Backoff bookkeeping for invite codes that have failed to resolve at least once.
+const inviteResolutionRetryState = new Map<string, { failCount: number; nextRetryAt: number; }>();
+// Bounded-concurrency queue so a burst of new posts doesn't fire dozens of simultaneous
+// resolveInvite calls at once and trip Discord's rate limiting.
+const inviteResolutionQueue: string[] = [];
+const queuedOrResolvingInviteCodes = new Set<string>();
+let activeInviteResolutions = 0;
 const similarityCache = new Map<string, number>();
 const trackedInviteGuildIds = new Set(FALLBACKS.targetInviteGuildIds);
 let trackedGuildListRefreshTimer: number | null = null;
@@ -542,29 +560,72 @@ function isTargetInviteGuild(guildId: string) {
 function scheduleInviteGuildResolution(inviteCode: string) {
     const normalizedCode = inviteCode.toLowerCase();
     if (!normalizedCode) return;
-    if (inviteGuildIdCache.has(normalizedCode) || resolvingInviteCodes.has(normalizedCode)) return;
+    if (inviteGuildIdCache.has(normalizedCode)) return;
+    if (queuedOrResolvingInviteCodes.has(normalizedCode)) return;
 
-    resolvingInviteCodes.add(normalizedCode);
-    void InviteActions.resolveInvite(normalizedCode, "Pl5PostDuplicateHighlighter")
-        .then((result: any) => {
-            const guildId = result?.invite?.guild?.id;
-            inviteGuildIdCache.set(normalizedCode, typeof guildId === "string" ? guildId : null);
-        })
-        .catch(() => {
-            inviteGuildIdCache.set(normalizedCode, null);
-        })
-        .finally(() => {
-            resolvingInviteCodes.delete(normalizedCode);
+    const retryState = inviteResolutionRetryState.get(normalizedCode);
+    if (retryState && retryState.nextRetryAt > Date.now()) return;
 
-            const resolvedGuildId = inviteGuildIdCache.get(normalizedCode) ?? "";
-            for (const cached of postTextCache.values()) {
-                if (cached.inviteCode === normalizedCode) {
-                    cached.inviteGuildId = resolvedGuildId;
-                }
-            }
+    queuedOrResolvingInviteCodes.add(normalizedCode);
+    inviteResolutionQueue.push(normalizedCode);
+    pumpInviteResolutionQueue();
+}
 
-            scheduleRefresh();
+function pumpInviteResolutionQueue() {
+    while (activeInviteResolutions < LIMITS.maxConcurrentInviteResolutions && inviteResolutionQueue.length) {
+        const normalizedCode = inviteResolutionQueue.shift();
+        if (normalizedCode == null) break;
+        void resolveInviteGuildId(normalizedCode);
+    }
+}
+
+async function resolveInviteGuildId(normalizedCode: string) {
+    activeInviteResolutions++;
+    try {
+        const result: any = await InviteActions.resolveInvite(normalizedCode, "Pl5PostDuplicateHighlighter");
+        const guildId = result?.invite?.guild?.id;
+        // Confirmed resolution: either a real guild id, or "" meaning the invite is
+        // valid but isn't attached to a guild (e.g. a group DM invite). Either way we
+        // now know the answer and don't need to retry it again.
+        inviteGuildIdCache.set(normalizedCode, typeof guildId === "string" ? guildId : "");
+        inviteResolutionRetryState.delete(normalizedCode);
+    } catch (error) {
+        // Resolution failed (expired/invalid invite, transient network error, rate
+        // limit, etc). Do NOT cache this as a confirmed "no guild" - that previously
+        // caused posts to permanently lose eligibility for the tracked-guild highlight
+        // after a single hiccup. Instead, back off and let a later scan retry it.
+        const previousFailCount = inviteResolutionRetryState.get(normalizedCode)?.failCount ?? 0;
+        const failCount = previousFailCount + 1;
+        const backoffMs = Math.min(
+            LIMITS.inviteResolutionRetry.maxMs,
+            LIMITS.inviteResolutionRetry.baseMs * (2 ** (failCount - 1)),
+        );
+
+        inviteResolutionRetryState.set(normalizedCode, {
+            failCount,
+            nextRetryAt: Date.now() + backoffMs,
         });
+
+        logDebug("Invite resolution failed, will retry with backoff", {
+            normalizedCode,
+            failCount,
+            backoffMs,
+            error,
+        });
+    } finally {
+        queuedOrResolvingInviteCodes.delete(normalizedCode);
+        activeInviteResolutions--;
+
+        const resolvedGuildId = inviteGuildIdCache.get(normalizedCode) ?? "";
+        for (const cached of postTextCache.values()) {
+            if (cached.inviteCode === normalizedCode) {
+                cached.inviteGuildId = resolvedGuildId;
+            }
+        }
+
+        scheduleRefresh();
+        pumpInviteResolutionQueue();
+    }
 }
 
 function snowflakeToTimestamp(id: string) {
@@ -721,8 +782,17 @@ function getPostText(channelId: string) {
 
     const cached = postTextCache.get(channelId);
     if (cached && cached.firstMessageId === message.id) {
-        if (cached.inviteCode && !cached.inviteGuildId && inviteGuildIdCache.has(cached.inviteCode)) {
-            cached.inviteGuildId = inviteGuildIdCache.get(cached.inviteCode) ?? "";
+        if (cached.inviteCode && !cached.inviteGuildId) {
+            if (inviteGuildIdCache.has(cached.inviteCode)) {
+                cached.inviteGuildId = inviteGuildIdCache.get(cached.inviteCode) ?? "";
+            } else {
+                // Previously this branch never re-scheduled resolution, so once a post's
+                // first message was cached (true for almost every scan after the first),
+                // a still-unresolved invite would never get another resolution attempt -
+                // it silently sat at "" forever even after the queue/backoff above would
+                // otherwise have retried it. Re-arm it here on every cache-hit scan.
+                scheduleInviteGuildResolution(cached.inviteCode);
+            }
         }
 
         return {
@@ -1419,7 +1489,10 @@ export default definePlugin({
         renderedRecords.clear();
         postTextCache.clear();
         inviteGuildIdCache.clear();
-        resolvingInviteCodes.clear();
+        inviteResolutionRetryState.clear();
+        inviteResolutionQueue.length = 0;
+        queuedOrResolvingInviteCodes.clear();
+        activeInviteResolutions = 0;
         similarityCache.clear();
         duplicateHistory = [];
         duplicateHistorySignature = "";
