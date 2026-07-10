@@ -10,6 +10,7 @@ import definePlugin, { OptionType } from "@utils/types";
 import { ChannelRouter, ChannelStore, createRoot, InviteActions, Menu, MessageStore, React, SelectedChannelStore, useStateFromStores } from "@webpack/common";
 import type { Root } from "react-dom/client";
 
+import { checkRules, type RuleCheckOptions, type RuleViolation } from "./rules";
 import trackedGuildList from "./trackedGuilds.json";
 
 const FIXED_IDS = {
@@ -22,6 +23,7 @@ const COLORS = {
     duplicateWarning: 0xfacc15,
     unique: 0x4ade80,
     targetInviteGuild: 0x00e5ff,
+    violation: 0x00e5ff,
 } as const;
 
 const LIMITS = {
@@ -65,7 +67,7 @@ const PATTERNS = {
     snowflake: /\d{17,20}/g,
 } as const;
 
-type HighlightState = "duplicate" | "unique" | "targetInviteGuild";
+type HighlightState = "duplicate" | "unique" | "targetInviteGuild" | "violation";
 type MatchReason = "title" | "invite" | "content";
 
 interface ThreadRecord {
@@ -84,6 +86,7 @@ interface ThreadRecord {
     matchedReasons: MatchReason[];
     matchedContentSimilarity: number | null;
     excludedByPattern: boolean;
+    violations: RuleViolation[];
 }
 
 interface MatchEvaluation {
@@ -194,6 +197,38 @@ const settings = definePluginSettings({
                 return `Invalid regex: ${error?.message ?? "unknown error"}`;
             }
         }
+    },
+    ruleMultipleInvites: {
+        type: OptionType.BOOLEAN,
+        default: true,
+        description: "C2-1: Flag posts containing more than one server invite",
+    },
+    ruleMissingTags: {
+        type: OptionType.BOOLEAN,
+        default: true,
+        description: "C2-4: Flag posts missing both the Faction and Community Hub tags",
+    },
+    ruleTitleQuality: {
+        type: OptionType.BOOLEAN,
+        default: true,
+        description: "C2-5/C2-7: Flag titles using custom unicode letters, decorative symbols, or sensationalist language",
+    },
+    ruleUndisclosedAi: {
+        type: OptionType.BOOLEAN,
+        default: true,
+        description: "C2-11: Flag posts that look AI-written without a plain-text AI disclosure",
+    },
+    aiSignalThreshold: {
+        type: OptionType.SLIDER,
+        markers: [1, 2, 3, 4, 5, 6],
+        default: 3,
+        stickToMarkers: true,
+        description: "AI-writing signal points required before flagging C2-11 (higher = fewer false positives)",
+    },
+    showViolationBadge: {
+        type: OptionType.BOOLEAN,
+        default: true,
+        description: "Show a corner badge listing violated rule codes on flagged posts",
     },
     checkTitle: {
         type: OptionType.BOOLEAN,
@@ -461,6 +496,16 @@ function getTrackedGuildListRefreshMs() {
     return safeMinutes * 60 * 1000;
 }
 
+function getRuleCheckOptions(): RuleCheckOptions {
+    return {
+        multipleInvites: settings.store.ruleMultipleInvites,
+        tagCheck: settings.store.ruleMissingTags,
+        titleQuality: settings.store.ruleTitleQuality,
+        aiDisclosure: settings.store.ruleUndisclosedAi,
+        aiSignalThreshold: Number(settings.store.aiSignalThreshold) || 3,
+    };
+}
+
 function getWarningDuplicateThresholdMs() {
     const minutes = Number(settings.store.warningDuplicateThresholdMinutes);
     const safeMinutes = Number.isFinite(minutes)
@@ -684,6 +729,10 @@ function hexToRgba(hexColor: number, alpha: number) {
 function getHighlightColor(record: ThreadRecord) {
     if (record.highlight === "targetInviteGuild") {
         return COLORS.targetInviteGuild;
+    }
+
+    if (record.highlight === "violation") {
+        return COLORS.violation;
     }
 
     if (record.highlight !== "duplicate") {
@@ -1002,6 +1051,10 @@ function applyExpiryTooltip(element: HTMLElement, record: ThreadRecord) {
         tooltipLines.push("Excluded by regex pattern");
     }
 
+    if (record.violations.length) {
+        tooltipLines.push(`Violations: ${record.violations.map(violation => `${violation.code} (${violation.summary})`).join("; ")}`);
+    }
+
     if (record.matchedPreviousDeltaMs == null) {
         tooltipLines.push("Matching previous post: none");
     } else {
@@ -1053,12 +1106,20 @@ function buildThreadRecords() {
             matchedReasons: [],
             matchedContentSimilarity: null,
             excludedByPattern: false,
+            violations: [],
         };
 
         const { content, inviteCode, inviteGuildId } = getPostText(thread.id);
         record.inviteCode = inviteCode;
         record.inviteGuildId = inviteGuildId;
         record.contentSnippet = normalizeContent(content);
+        record.violations = checkRules({
+            rawTitle: thread.name ?? "",
+            content,
+            appliedTags: Array.isArray((thread as any).appliedTags)
+                ? (thread as any).appliedTags.map(String)
+                : [],
+        }, getRuleCheckOptions());
 
         if (isTargetInviteGuild(record.inviteGuildId)) {
             record.highlight = "targetInviteGuild";
@@ -1076,7 +1137,13 @@ function buildThreadRecords() {
         }
 
         const duplicateInfo = getDuplicateInfo(record, previousRecords, activeRecords, windowMs);
-        record.highlight = duplicateInfo.isDuplicate ? "duplicate" : "unique";
+        // Tint priority: tracked guild > duplicate > violation > unique.
+        // Violations on tracked/duplicate posts still surface via badge + tooltip.
+        record.highlight = duplicateInfo.isDuplicate
+            ? "duplicate"
+            : record.violations.length
+                ? "violation"
+                : "unique";
         record.duplicateUntil = duplicateInfo.duplicateUntil;
         record.duplicateSourceThreadId = duplicateInfo.duplicateSourceThreadId;
         record.matchedPreviousThreadId = duplicateInfo.matchedPreviousThreadId;
@@ -1195,6 +1262,31 @@ function setCardStyle(element: HTMLElement, property: string, value: string) {
     element.style.setProperty(property, value, "important");
 }
 
+function applyViolationBadge(element: HTMLElement, record: ThreadRecord) {
+    if (!settings.store.showViolationBadge || !record.violations.length) {
+        removeViolationBadge(element);
+        return;
+    }
+
+    // The ::after badge is absolutely positioned, so the card needs to be a
+    // positioning context. Only patch cards that are position: static so we
+    // never break Discord's own absolutely-positioned list items.
+    if (element.dataset.vcPl5PositionPatched !== "1" && getComputedStyle(element).position === "static") {
+        element.dataset.vcPl5PositionPatched = "1";
+        element.style.setProperty("position", "relative");
+    }
+
+    element.setAttribute("data-vc-pl5-violations", record.violations.map(violation => violation.code).join(" "));
+}
+
+function removeViolationBadge(element: HTMLElement) {
+    element.removeAttribute("data-vc-pl5-violations");
+    if (element.dataset.vcPl5PositionPatched === "1") {
+        delete element.dataset.vcPl5PositionPatched;
+        element.style.removeProperty("position");
+    }
+}
+
 function applyHighlightToCard(element: HTMLElement, record: ThreadRecord) {
     if (record.highlight === "unique" && !settings.store.tintUniquePosts) {
         element.dataset.vcPl5PostDuplicateHighlighter = record.highlight;
@@ -1203,6 +1295,7 @@ function applyHighlightToCard(element: HTMLElement, record: ThreadRecord) {
         element.style.removeProperty("border-style");
         element.style.removeProperty("border-width");
         element.style.removeProperty("box-shadow");
+        applyViolationBadge(element, record);
         applyExpiryTooltip(element, record);
         return;
     }
@@ -1211,7 +1304,9 @@ function applyHighlightToCard(element: HTMLElement, record: ThreadRecord) {
     const rgb = `#${color.toString(16).padStart(6, "0")}`;
     const translucent = record.highlight === "targetInviteGuild"
         ? hexToRgba(color, 0.28)
-        : hexToRgba(color, 0.12);
+        : record.highlight === "violation"
+            ? hexToRgba(color, 0.16)
+            : hexToRgba(color, 0.12);
 
     element.dataset.vcPl5PostDuplicateHighlighter = record.highlight;
     setCardStyle(element, "background-color", translucent);
@@ -1219,6 +1314,7 @@ function applyHighlightToCard(element: HTMLElement, record: ThreadRecord) {
     element.style.removeProperty("border-style");
     element.style.removeProperty("border-width");
     element.style.removeProperty("box-shadow");
+    applyViolationBadge(element, record);
     applyExpiryTooltip(element, record);
 
     logDebug("applyHighlightToCard", {
@@ -1234,6 +1330,7 @@ function clearHighlightFromCard(element: HTMLElement) {
     if (!element.dataset.vcPl5PostDuplicateHighlighter) return;
 
     delete element.dataset.vcPl5PostDuplicateHighlighter;
+    removeViolationBadge(element);
     const targets: HTMLElement[] = [element];
 
     // Legacy cleanup: previous versions also tinted parent/child containers.
@@ -1334,6 +1431,37 @@ function scheduleRefresh() {
     }, 80);
 }
 
+const BADGE_STYLE_ID = "vc-pl5-post-duplicate-highlighter-badge-style";
+
+function injectBadgeStyles() {
+    if (document.getElementById(BADGE_STYLE_ID)) return;
+
+    const style = document.createElement("style");
+    style.id = BADGE_STYLE_ID;
+    style.textContent = `
+[data-vc-pl5-violations]::after {
+    content: attr(data-vc-pl5-violations);
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    z-index: 100;
+    padding: 2px 6px;
+    border-radius: 4px;
+    background: rgba(0, 229, 255, 0.92);
+    color: #00343a;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    pointer-events: none;
+}
+`;
+    document.head.appendChild(style);
+}
+
+function removeBadgeStyles() {
+    document.getElementById(BADGE_STYLE_ID)?.remove();
+}
+
 function attachObserver() {
     if (mutationObserver || typeof MutationObserver === "undefined") return;
 
@@ -1380,6 +1508,12 @@ function Driver() {
         "similarityThreshold",
         "showExpiryTooltip",
         "tintUniquePosts",
+        "ruleMultipleInvites",
+        "ruleMissingTags",
+        "ruleTitleQuality",
+        "ruleUndisclosedAi",
+        "aiSignalThreshold",
+        "showViolationBadge",
         "debugLogs",
     ]);
 
@@ -1389,7 +1523,7 @@ function Driver() {
             const threads = ChannelStore.getAllThreadsForParent(FIXED_IDS.forumChannelId)
                 .filter(channel => channel?.isForumPost?.() && channel.getGuildId() === FIXED_IDS.guildId);
             const selected = SelectedChannelStore.getChannelId() ?? "";
-            return `${selected}|${threads.map(thread => `${thread.id}:${thread.lastMessageId ?? ""}:${thread.messageCount ?? 0}:${MessageStore.getMessages(thread.id)?._array.length ?? 0}`).join("|")}`;
+            return `${selected}|${threads.map(thread => `${thread.id}:${thread.lastMessageId ?? ""}:${thread.messageCount ?? 0}:${MessageStore.getMessages(thread.id)?._array.length ?? 0}:${((thread as any).appliedTags ?? []).join(",")}`).join("|")}`;
         },
         null,
         (oldValue, newValue) => oldValue === newValue
@@ -1455,7 +1589,7 @@ const patchThreadContextMenu: NavContextMenuPatchCallback = (children, { channel
 
 export default definePlugin({
     name: "Pl5PostDuplicateHighlighter",
-    description: "Highlights forum posts in the target channel when they appear to duplicate a recent post.",
+    description: "Highlights forum posts in the target channel that duplicate a recent post or appear to violate the C2 advertising guidelines.",
     authors: [
         {
             id: 471040217030328320n,
@@ -1469,6 +1603,7 @@ export default definePlugin({
 
     start() {
         logDebug("start()");
+        injectBadgeStyles();
         mountDriver();
         attachObserver();
         attachHeartbeat();
@@ -1485,6 +1620,10 @@ export default definePlugin({
         for (const element of document.querySelectorAll<HTMLElement>("[data-vc-pl5-post-duplicate-highlighter]")) {
             clearHighlightFromCard(element);
         }
+        for (const element of document.querySelectorAll<HTMLElement>("[data-vc-pl5-violations]")) {
+            removeViolationBadge(element);
+        }
+        removeBadgeStyles();
 
         renderedRecords.clear();
         postTextCache.clear();
