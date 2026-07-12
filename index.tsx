@@ -221,7 +221,7 @@ const settings = definePluginSettings({
     aiSignalThreshold: {
         type: OptionType.SLIDER,
         markers: [1, 2, 3, 4, 5, 6],
-        default: 3,
+        default: 4,
         stickToMarkers: true,
         description: "AI-writing signal points required before flagging C2-11 (higher = fewer false positives)",
     },
@@ -336,7 +336,7 @@ function emitDuplicateHistory() {
 function DuplicateHistoryPanel() {
     const [, setVersion] = React.useState(0);
 
-    React.useEffect(() => subscribeDuplicateHistory(() => setVersion(v => v + 1)), []);
+    React.useEffect(() => subscribeDuplicateHistory(() => setVersion((v: number) => v + 1)), []);
 
     const items = duplicateHistory.slice(0, 30);
     if (!items.length) {
@@ -1075,8 +1075,8 @@ function applyExpiryTooltip(element: HTMLElement, record: ThreadRecord) {
 function buildThreadRecords() {
     const windowMs = getDuplicateWindowMs();
     const threads = ChannelStore.getAllThreadsForParent(FIXED_IDS.forumChannelId)
-        .filter(channel => channel?.isForumPost?.() && channel.getGuildId() === FIXED_IDS.guildId)
-        .sort((left, right) => getThreadCreatedAt(left) - getThreadCreatedAt(right));
+        .filter((channel: any) => channel?.isForumPost?.() && channel.getGuildId() === FIXED_IDS.guildId)
+        .sort((left: any, right: any) => getThreadCreatedAt(left) - getThreadCreatedAt(right));
 
     const activeRecords: ThreadRecord[] = [];
     const previousRecords: ThreadRecord[] = [];
@@ -1521,12 +1521,12 @@ function Driver() {
         [ChannelStore, MessageStore, SelectedChannelStore],
         () => {
             const threads = ChannelStore.getAllThreadsForParent(FIXED_IDS.forumChannelId)
-                .filter(channel => channel?.isForumPost?.() && channel.getGuildId() === FIXED_IDS.guildId);
+                .filter((channel: any) => channel?.isForumPost?.() && channel.getGuildId() === FIXED_IDS.guildId);
             const selected = SelectedChannelStore.getChannelId() ?? "";
-            return `${selected}|${threads.map(thread => `${thread.id}:${thread.lastMessageId ?? ""}:${thread.messageCount ?? 0}:${MessageStore.getMessages(thread.id)?._array.length ?? 0}:${((thread as any).appliedTags ?? []).join(",")}`).join("|")}`;
+            return `${selected}|${threads.map((thread: any) => `${thread.id}:${thread.lastMessageId ?? ""}:${thread.messageCount ?? 0}:${MessageStore.getMessages(thread.id)?._array.length ?? 0}:${((thread as any).appliedTags ?? []).join(",")}`).join("|")}`;
         },
         null,
-        (oldValue, newValue) => oldValue === newValue
+        (oldValue: any, newValue: any) => oldValue === newValue
     );
 
     React.useEffect(() => {
@@ -1555,7 +1555,7 @@ function mountDriver() {
     document.body.appendChild(mountNode);
 
     reactRoot = createRoot(mountNode);
-    reactRoot.render(<Driver />);
+    reactRoot?.render(<Driver />);
 }
 
 function unmountDriver() {
@@ -1565,7 +1565,7 @@ function unmountDriver() {
     mountNode = null;
 }
 
-const patchThreadContextMenu: NavContextMenuPatchCallback = (children, { channel }: any) => {
+const patchThreadContextMenu: NavContextMenuPatchCallback = (children: any, { channel }: any) => {
     if (!settings.store.enabled) return;
 
     const thread = channel ?? null;
