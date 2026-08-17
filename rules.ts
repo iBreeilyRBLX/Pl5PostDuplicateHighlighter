@@ -187,14 +187,6 @@ function hasUniformParagraphs(content: string): boolean {
     return Math.sqrt(variance) / mean < 0.25;
 }
 
-function hasExcessiveCaps(title: string) {
-    const letters = title.replace(/[^a-z]/gi, "");
-    if (letters.length < 10) return false;
-
-    const uppercase = letters.replace(/[^A-Z]/g, "").length;
-    return uppercase / letters.length >= 0.75;
-}
-
 function collectAiSignals(content: string): AiSignal[] {
     const signals: AiSignal[] = [];
     const lines = content.split("\n");
@@ -329,7 +321,6 @@ function checkTitleQuality(rawTitle: string): RuleViolation | null {
     if (FANCY_LETTERS.test(rawTitle) || ZALGO.test(rawTitle)) issues.push("custom unicode letters");
     if (DECORATIVE_SYMBOLS.test(rawTitle)) issues.push("decorative symbols");
     if (SENSATIONAL.test(rawTitle)) issues.push("sensationalist language");
-    if (hasExcessiveCaps(rawTitle)) issues.push("excessive caps");
     if (EXCESSIVE_PUNCTUATION.test(rawTitle)) issues.push("excessive punctuation");
 
     if (!issues.length) return null;

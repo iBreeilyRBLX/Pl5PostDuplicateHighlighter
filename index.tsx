@@ -4,123 +4,25 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+import { ApplicationCommandInputType } from "@api/Commands";
 import { NavContextMenuPatchCallback } from "@api/ContextMenu";
 import { definePluginSettings } from "@api/Settings";
 import definePlugin, { OptionType } from "@utils/types";
-import { ChannelRouter, ChannelStore, createRoot, InviteActions, Menu, MessageStore, React, SelectedChannelStore, useStateFromStores } from "@webpack/common";
+import { Button, ChannelRouter, ChannelStore, createRoot, InviteActions, Menu, MessageActions, MessageStore, React, SelectedChannelStore, useStateFromStores } from "@webpack/common";
 import type { Root } from "react-dom/client";
 
+import { BADGE_STYLE_ID, CACHE_KEYS, COLORS, FIXED_IDS, LIMITS, LOG_PREFIX, PATTERNS, TIMING } from "./constants";
+import { openDuplicateHistoryModal } from "./DuplicateModal";
 import { checkRules, type RuleCheckOptions, type RuleViolation } from "./rules";
 import trackedGuildList from "./trackedGuilds.json";
-
-const FIXED_IDS = {
-    guildId: "553917324340625424",
-    forumChannelId: "1210394762268643328",
-} as const;
-
-const COLORS = {
-    duplicate: 0xff6b6b,
-    duplicateWarning: 0xfacc15,
-    unique: 0x4ade80,
-    targetInviteGuild: 0x00e5ff,
-    violation: 0x00e5ff,
-} as const;
-
-const LIMITS = {
-    duplicateWindowMinutes: {
-        default: 720,
-        min: 1,
-        max: 10080,
-    },
-    warningDuplicateThresholdMinutes: {
-        default: 3,
-        min: 1,
-        max: 1440,
-    },
-    trackedListRefreshMinutes: {
-        default: 15,
-        min: 1,
-        max: 1440,
-    },
-    maxConcurrentInviteResolutions: 4,
-    inviteResolutionRetry: {
-        // Exponential backoff for failed invite resolutions (expired/invalid invite,
-        // transient network error, Discord API rate limit, etc). Previously a single
-        // failure permanently marked a post as "not a target guild" for the rest of
-        // the session; this lets it keep retrying at an increasing interval instead.
-        baseMs: 10_000,
-        maxMs: 5 * 60_000,
-    },
-} as const;
+import type { DuplicateHistoryEntry, ForumCardMatch, MatchEvaluation, MatchReason, RecordSummary, ThreadRecord, TrackedGuildListCache, ViolationNoticeContext } from "./types";
+import { openViolationTextModal } from "./ViolationModal";
 
 const FALLBACKS = {
     similarityThreshold: 75,
     targetInviteGuildIds: normalizeGuildIds(trackedGuildList?.guildIds),
 } as const;
 
-const CACHE_KEYS = {
-    trackedGuildList: "vc-pl5-tracked-guild-list-v1",
-} as const;
-
-const PATTERNS = {
-    discordInvite: /(?:https?:\/\/)?(?:www\.)?(?:discord\.gg|discord(?:app)?\.com\/invite)\/([a-zA-Z0-9-]+)/i,
-    snowflake: /\d{17,20}/g,
-} as const;
-
-type HighlightState = "duplicate" | "unique" | "targetInviteGuild" | "violation";
-type MatchReason = "title" | "invite" | "content";
-
-interface ThreadRecord {
-    threadId: string;
-    createdAt: number;
-    title: string;
-    inviteCode: string;
-    inviteGuildId: string;
-    contentSnippet: string;
-    highlight: HighlightState;
-    duplicateUntil: number | null;
-    duplicateSourceThreadId: string | null;
-    matchedPreviousThreadId: string | null;
-    matchedPreviousDeltaMs: number | null;
-    matchedPreviousTitle: string;
-    matchedReasons: MatchReason[];
-    matchedContentSimilarity: number | null;
-    excludedByPattern: boolean;
-    violations: RuleViolation[];
-}
-
-interface MatchEvaluation {
-    matched: boolean;
-    reasons: MatchReason[];
-    contentSimilarity: number | null;
-}
-
-interface DuplicateHistoryEntry {
-    threadId: string;
-    sourceThreadId: string;
-    threadTitle: string;
-    sourceTitle: string;
-    deltaMs: number;
-    reasons: MatchReason[];
-    contentSimilarity: number | null;
-    createdAt: number;
-}
-
-interface ForumCardMatch {
-    element: HTMLElement;
-    threadId: string;
-}
-
-interface RecordSummary {
-    threadId: string;
-    title: string;
-}
-
-interface TrackedGuildListCache {
-    guildIds: string[];
-    updatedAt: number;
-    sourceUrl: string;
-}
 
 const settings = definePluginSettings({
     enabled: {
@@ -260,7 +162,11 @@ const settings = definePluginSettings({
     duplicateHistoryPanel: {
         type: OptionType.COMPONENT,
         description: "Recent duplicate matches",
-        component: () => <DuplicateHistoryPanel />,
+        component: () => (
+            <Button size={Button.Sizes.SMALL} onClick={openDuplicateHistoryModal}>
+                Open duplicate history
+            </Button>
+        ),
     },
     debugLogs: {
         type: OptionType.BOOLEAN,
@@ -276,10 +182,17 @@ let scanQueued = false;
 let refreshTimer: number | null = null;
 let heartbeatTimer: number | null = null;
 let renderedRecords = new Map<string, ThreadRecord>();
-let duplicateHistory: DuplicateHistoryEntry[] = [];
-let duplicateHistorySignature = "";
+export let duplicateHistory: DuplicateHistoryEntry[] = readDuplicateHistoryCache();
+let duplicateHistorySignature = computeDuplicateHistorySignature(duplicateHistory);
 const duplicateHistoryListeners = new Set<() => void>();
 const postTextCache = new Map<string, { firstMessageId: string; content: string; inviteCode: string; inviteGuildId: string; }>();
+// checkRules() runs a dozen-plus regexes (title quality, invite counting, and
+// especially the C2-11 AI-signal detector) over full post content. Without this
+// cache it re-ran on every thread on every scan - every mutation-observer tick and
+// every 30s heartbeat - even when nothing about that post had changed, which was a
+// major source of the "laggy while browsing the forum" cost. Keyed by thread id;
+// invalidated when the first message, title, tags, or rule settings actually change.
+const ruleViolationsCache = new Map<string, { firstMessageId: string; rawTitle: string; appliedTagsKey: string; optionsKey: string; violations: RuleViolation[]; }>();
 // Only ever holds CONFIRMED resolutions (a real guild id, or "" for "resolved, no guild").
 // Codes that are pending, queued, or have failed and are awaiting retry are intentionally
 // absent from this map so callers can tell "not yet known" apart from "confirmed empty".
@@ -291,6 +204,16 @@ const inviteResolutionRetryState = new Map<string, { failCount: number; nextRetr
 const inviteResolutionQueue: string[] = [];
 const queuedOrResolvingInviteCodes = new Set<string>();
 let activeInviteResolutions = 0;
+// Backoff bookkeeping for threads whose first message failed to fetch at least once.
+const messageFetchRetryState = new Map<string, { failCount: number; nextRetryAt: number; }>();
+// Bounded-concurrency queue for proactively fetching a forum thread's first message
+// when it isn't already cached client-side (e.g. right after a restart, or for a post
+// the officer hasn't opened yet) - without this, duplicate/violation checks that need
+// message content, and history entries that need the author, silently fall back to
+// empty/"Unknown" until someone happens to open the thread.
+const messageFetchQueue: string[] = [];
+const queuedOrFetchingMessageThreadIds = new Set<string>();
+let activeMessageFetches = 0;
 const similarityCache = new Map<string, number>();
 const trackedInviteGuildIds = new Set(FALLBACKS.targetInviteGuildIds);
 let trackedGuildListRefreshTimer: number | null = null;
@@ -302,13 +225,13 @@ let excludeRegexCache: RegExp | null = null;
 
 function logDebug(message: string, ...args: any[]) {
     if (!settings.store.debugLogs) return;
-    console.log("[Pl5PostDuplicateHighlighter]", message, ...args);
+    console.log(LOG_PREFIX, message, ...args);
 }
 
 function logDebugGroup(title: string, entries: Array<() => void>) {
     if (!settings.store.debugLogs) return;
 
-    console.groupCollapsed(`[Pl5PostDuplicateHighlighter] ${title}`);
+    console.groupCollapsed(`${LOG_PREFIX} ${title}`);
     try {
         for (const entry of entries) entry();
     } finally {
@@ -316,7 +239,75 @@ function logDebugGroup(title: string, entries: Array<() => void>) {
     }
 }
 
-function subscribeDuplicateHistory(listener: () => void) {
+function isDuplicateHistoryEntry(value: unknown): value is DuplicateHistoryEntry {
+    if (!value || typeof value !== "object") return false;
+
+    const entry = value as Partial<DuplicateHistoryEntry>;
+    return typeof entry.threadId === "string"
+        && typeof entry.sourceThreadId === "string"
+        && typeof entry.createdAt === "number"
+        && Array.isArray(entry.reasons)
+        && Array.isArray(entry.violations);
+}
+
+function readDuplicateHistoryCache(): DuplicateHistoryEntry[] {
+    try {
+        const raw = localStorage.getItem(CACHE_KEYS.duplicateHistory);
+        if (!raw) return [];
+
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) return [];
+
+        return parsed.filter(isDuplicateHistoryEntry).slice(0, LIMITS.duplicateHistoryMaxEntries);
+    } catch {
+        return [];
+    }
+}
+
+function writeDuplicateHistoryCache(history: DuplicateHistoryEntry[]) {
+    try {
+        localStorage.setItem(CACHE_KEYS.duplicateHistory, JSON.stringify(history));
+    } catch {
+        // Ignore storage failures (quota exceeded, private browsing, etc).
+    }
+}
+
+function computeDuplicateHistorySignature(history: DuplicateHistoryEntry[]) {
+    return history.map(entry => `${entry.threadId}:${entry.sourceThreadId}:${entry.createdAt}`).join("|");
+}
+
+function mergeDuplicateHistoryEntry(previous: DuplicateHistoryEntry, incoming: DuplicateHistoryEntry): DuplicateHistoryEntry {
+    // Prefer the freshly-computed entry, but a scan that ran before this thread's first
+    // message was cached (author "Unknown", empty snippet/invite) shouldn't clobber
+    // better data an earlier scan already recorded for the same thread.
+    return {
+        ...incoming,
+        authorName: incoming.authorName && incoming.authorName !== "Unknown" ? incoming.authorName : previous.authorName,
+        authorId: incoming.authorId || previous.authorId,
+        contentSnippet: incoming.contentSnippet || previous.contentSnippet,
+        inviteCode: incoming.inviteCode || previous.inviteCode,
+    };
+}
+
+function mergeDuplicateHistory(existing: DuplicateHistoryEntry[], incoming: DuplicateHistoryEntry[]) {
+    const merged = new Map<string, DuplicateHistoryEntry>();
+
+    // Persisted entries first, then let a freshly-computed entry for the same thread
+    // overwrite it with up-to-date data. This is what makes the log survive a plugin
+    // or Discord restart instead of resetting to only whatever's currently loaded in
+    // the client's thread/message caches.
+    for (const entry of existing) merged.set(entry.threadId, entry);
+    for (const entry of incoming) {
+        const previous = merged.get(entry.threadId);
+        merged.set(entry.threadId, previous ? mergeDuplicateHistoryEntry(previous, entry) : entry);
+    }
+
+    return [...merged.values()]
+        .sort((left, right) => right.createdAt - left.createdAt)
+        .slice(0, LIMITS.duplicateHistoryMaxEntries);
+}
+
+export function subscribeDuplicateHistory(listener: () => void) {
     duplicateHistoryListeners.add(listener);
     return () => {
         duplicateHistoryListeners.delete(listener);
@@ -506,6 +497,40 @@ function getRuleCheckOptions(): RuleCheckOptions {
     };
 }
 
+function getCachedRuleViolations(
+    threadId: string,
+    rawTitle: string,
+    content: string,
+    appliedTags: string[],
+    firstMessageId: string,
+    options: RuleCheckOptions,
+): RuleViolation[] {
+    const appliedTagsKey = appliedTags.join(",");
+    const optionsKey = `${options.multipleInvites}|${options.tagCheck}|${options.titleQuality}|${options.aiDisclosure}|${options.aiSignalThreshold}`;
+
+    // Don't cache the "message not loaded yet" state (empty firstMessageId) - let it
+    // keep recomputing (cheap on empty content) until the real message arrives, then
+    // start caching against its actual id.
+    if (!firstMessageId) {
+        return checkRules({ rawTitle, content, appliedTags }, options);
+    }
+
+    const cached = ruleViolationsCache.get(threadId);
+    if (
+        cached
+        && cached.firstMessageId === firstMessageId
+        && cached.rawTitle === rawTitle
+        && cached.appliedTagsKey === appliedTagsKey
+        && cached.optionsKey === optionsKey
+    ) {
+        return cached.violations;
+    }
+
+    const violations = checkRules({ rawTitle, content, appliedTags }, options);
+    ruleViolationsCache.set(threadId, { firstMessageId, rawTitle, appliedTagsKey, optionsKey, violations });
+    return violations;
+}
+
 function getWarningDuplicateThresholdMs() {
     const minutes = Number(settings.store.warningDuplicateThresholdMinutes);
     const safeMinutes = Number.isFinite(minutes)
@@ -673,6 +698,61 @@ async function resolveInviteGuildId(normalizedCode: string) {
     }
 }
 
+function scheduleFirstMessageFetch(threadId: string) {
+    if (!threadId) return;
+    if (queuedOrFetchingMessageThreadIds.has(threadId)) return;
+
+    const retryState = messageFetchRetryState.get(threadId);
+    if (retryState && retryState.nextRetryAt > Date.now()) return;
+
+    queuedOrFetchingMessageThreadIds.add(threadId);
+    messageFetchQueue.push(threadId);
+    pumpMessageFetchQueue();
+}
+
+function pumpMessageFetchQueue() {
+    while (activeMessageFetches < LIMITS.maxConcurrentMessageFetches && messageFetchQueue.length) {
+        const threadId = messageFetchQueue.shift();
+        if (threadId == null) break;
+        void fetchFirstMessage(threadId);
+    }
+}
+
+async function fetchFirstMessage(threadId: string) {
+    activeMessageFetches++;
+    try {
+        // Forum threads are typically short, so the latest `limit` messages almost
+        // always include the opening post; this mirrors the fetchMessages usage
+        // elsewhere in Vencord rather than reaching for a lower-level API.
+        await MessageActions.fetchMessages({ channelId: threadId, limit: 50 });
+        messageFetchRetryState.delete(threadId);
+    } catch (error) {
+        const previousFailCount = messageFetchRetryState.get(threadId)?.failCount ?? 0;
+        const failCount = previousFailCount + 1;
+        const backoffMs = Math.min(
+            LIMITS.messageFetchRetry.maxMs,
+            LIMITS.messageFetchRetry.baseMs * (2 ** (failCount - 1)),
+        );
+
+        messageFetchRetryState.set(threadId, {
+            failCount,
+            nextRetryAt: Date.now() + backoffMs,
+        });
+
+        logDebug("First-message fetch failed, will retry with backoff", {
+            threadId,
+            failCount,
+            backoffMs,
+            error,
+        });
+    } finally {
+        queuedOrFetchingMessageThreadIds.delete(threadId);
+        activeMessageFetches--;
+        scheduleRefresh();
+        pumpMessageFetchQueue();
+    }
+}
+
 function snowflakeToTimestamp(id: string) {
     try {
         return Number((BigInt(id) >> 22n) + 1420070400000n);
@@ -826,6 +906,10 @@ function isInTargetForumContext() {
 function getPostText(channelId: string) {
     const message = getFirstForumMessage(channelId);
     if (!message) {
+        // Message not cached client-side yet (e.g. right after a restart). Queue a
+        // fetch so content/invite/author data backfills on a later scan instead of
+        // staying empty until someone happens to open the thread.
+        scheduleFirstMessageFetch(channelId);
         return { content: "", inviteCode: "", inviteGuildId: "" };
     }
 
@@ -929,7 +1013,7 @@ function evaluateMatch(
             let similarity = similarityCache.get(similarityCacheKey);
             if (similarity == null) {
                 similarity = levenshteinSimilarity(left.contentSnippet, right.contentSnippet);
-                if (similarityCache.size > 4000) {
+                if (similarityCache.size > LIMITS.similarityCacheMaxEntries) {
                     similarityCache.clear();
                 }
                 similarityCache.set(similarityCacheKey, similarity);
@@ -1013,7 +1097,7 @@ function getDuplicateInfo(record: ThreadRecord, previousRecords: ThreadRecord[],
     };
 }
 
-function formatDuration(ms: number) {
+export function formatDuration(ms: number) {
     const safe = Math.max(0, ms);
     if (safe <= 0) return "0m";
 
@@ -1024,6 +1108,45 @@ function formatDuration(ms: number) {
     if (hours > 0 && minutes > 0) return `${hours}h ${minutes}m`;
     if (hours > 0) return `${hours}h`;
     return `${totalMinutes}m`;
+}
+
+// Prose duration for violation-notice text, e.g. "1 hour and 24 minutes" /
+// "45 minutes", matching the wording used in the C2 warning templates.
+function formatDurationWords(ms: number) {
+    const totalMinutes = Math.max(0, Math.round(ms / 60000));
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+
+    const hourPart = hours > 0 ? `${hours} hour${hours === 1 ? "" : "s"}` : "";
+    const minutePart = minutes > 0 ? `${minutes} minute${minutes === 1 ? "" : "s"}` : "";
+
+    if (hourPart && minutePart) return `${hourPart} and ${minutePart}`;
+    return hourPart || minutePart || "0 minutes";
+}
+
+function formatCooldownWindowLabel(ms: number) {
+    const totalMinutes = Math.max(0, Math.round(ms / 60000));
+    if (totalMinutes > 0 && totalMinutes % 60 === 0) {
+        return `${totalMinutes / 60}-hour cooldown`;
+    }
+
+    return `${formatDurationWords(ms)} cooldown`;
+}
+
+// C2-2: re-posting before the duplicate window (cooldown) has elapsed. This isn't
+// one of the rules.ts content checks - it's derived from the duplicate match itself -
+// so it's synthesized here rather than returned from checkRules().
+function buildCooldownViolation(record: ThreadRecord): RuleViolation | null {
+    if (record.highlight !== "duplicate" || record.matchedPreviousDeltaMs == null) return null;
+
+    const windowMs = getDuplicateWindowMs();
+    const earlyByMs = Math.max(0, windowMs - record.matchedPreviousDeltaMs);
+    if (earlyByMs <= 0) return null;
+
+    return {
+        code: "C2-2",
+        summary: `Posting ${formatDurationWords(earlyByMs)} early from ${formatCooldownWindowLabel(windowMs)}`,
+    };
 }
 
 function applyExpiryTooltip(element: HTMLElement, record: ThreadRecord) {
@@ -1113,13 +1236,19 @@ function buildThreadRecords() {
         record.inviteCode = inviteCode;
         record.inviteGuildId = inviteGuildId;
         record.contentSnippet = normalizeContent(content);
-        record.violations = checkRules({
-            rawTitle: thread.name ?? "",
+
+        const appliedTags = Array.isArray((thread as any).appliedTags)
+            ? (thread as any).appliedTags.map(String)
+            : [];
+        const firstMessageId = postTextCache.get(thread.id)?.firstMessageId ?? "";
+        record.violations = getCachedRuleViolations(
+            thread.id,
+            thread.name ?? "",
             content,
-            appliedTags: Array.isArray((thread as any).appliedTags)
-                ? (thread as any).appliedTags.map(String)
-                : [],
-        }, getRuleCheckOptions());
+            appliedTags,
+            firstMessageId,
+            getRuleCheckOptions(),
+        );
 
         if (isTargetInviteGuild(record.inviteGuildId)) {
             record.highlight = "targetInviteGuild";
@@ -1160,28 +1289,46 @@ function buildThreadRecords() {
 
     renderedRecords = nextRecords;
 
-    const history = [...nextRecords.values()]
+    const liveHistory = [...nextRecords.values()]
         .filter(record => record.highlight === "duplicate" && record.matchedPreviousThreadId && record.matchedPreviousDeltaMs != null)
         .sort((left, right) => right.createdAt - left.createdAt)
-        .slice(0, 50)
         .map(record => {
             const source = nextRecords.get(record.matchedPreviousThreadId!) ?? null;
+            const firstMessage = getFirstForumMessage(record.threadId);
+            const authorName = firstMessage?.author?.username ?? firstMessage?.author?.globalName ?? "Unknown";
+            const authorId = firstMessage?.author?.id ?? "";
+            // Every entry here is by definition a cooldown violation (that's what
+            // "duplicate" means), so this is always attached alongside any rules.ts
+            // violations - it's what makes "Copy violation notice" show for these.
+            const cooldownViolation = buildCooldownViolation(record);
+            const violations = cooldownViolation ? [cooldownViolation, ...record.violations] : record.violations;
             return {
                 threadId: record.threadId,
                 sourceThreadId: record.matchedPreviousThreadId!,
-                threadTitle: record.title,
-                sourceTitle: source?.title ?? "",
+                threadTitle: ChannelStore.getChannel(record.threadId)?.name ?? record.title,
+                sourceTitle: ChannelStore.getChannel(record.matchedPreviousThreadId!)?.name ?? source?.title ?? "",
                 deltaMs: record.matchedPreviousDeltaMs!,
                 reasons: record.matchedReasons,
                 contentSimilarity: record.matchedContentSimilarity,
                 createdAt: record.createdAt,
+                authorName,
+                authorId,
+                contentSnippet: record.contentSnippet,
+                inviteCode: record.inviteCode,
+                violations,
+                excludedByPattern: record.excludedByPattern,
             } as DuplicateHistoryEntry;
         });
 
-    const historySignature = history.map(entry => `${entry.threadId}:${entry.sourceThreadId}:${entry.createdAt}`).join("|");
+    // Merge into (rather than replace) the persisted log, so entries survive a plugin
+    // or Discord restart even before the client has reloaded every thread/message that
+    // originally fed a match.
+    const history = mergeDuplicateHistory(duplicateHistory, liveHistory);
+    const historySignature = computeDuplicateHistorySignature(history);
     if (historySignature !== duplicateHistorySignature) {
         duplicateHistorySignature = historySignature;
         duplicateHistory = history;
+        writeDuplicateHistoryCache(history);
         emitDuplicateHistory();
     }
 
@@ -1331,20 +1478,11 @@ function clearHighlightFromCard(element: HTMLElement) {
 
     delete element.dataset.vcPl5PostDuplicateHighlighter;
     removeViolationBadge(element);
-    const targets: HTMLElement[] = [element];
-
-    // Legacy cleanup: previous versions also tinted parent/child containers.
-    if (element.parentElement) targets.push(element.parentElement);
-    const firstChild = element.firstElementChild;
-    if (firstChild instanceof HTMLElement) targets.push(firstChild);
-
-    for (const target of targets) {
-        target.style.removeProperty("background-color");
-        target.style.removeProperty("border-color");
-        target.style.removeProperty("border-style");
-        target.style.removeProperty("border-width");
-        target.style.removeProperty("box-shadow");
-    }
+    element.style.removeProperty("background-color");
+    element.style.removeProperty("border-color");
+    element.style.removeProperty("border-style");
+    element.style.removeProperty("border-width");
+    element.style.removeProperty("box-shadow");
 
     if (element.dataset.vcPl5HadTitle === "1") {
         element.setAttribute("title", element.dataset.vcPl5OriginalTitle ?? "");
@@ -1426,12 +1564,10 @@ function scheduleRefresh() {
         try {
             refreshHighlights();
         } catch (error) {
-            console.error("[Pl5PostDuplicateHighlighter] Failed to refresh forum highlights", error);
+            console.error(`${LOG_PREFIX} Failed to refresh forum highlights`, error);
         }
-    }, 80);
+    }, TIMING.refreshDebounceMs);
 }
-
-const BADGE_STYLE_ID = "vc-pl5-post-duplicate-highlighter-badge-style";
 
 function injectBadgeStyles() {
     if (document.getElementById(BADGE_STYLE_ID)) return;
@@ -1465,7 +1601,16 @@ function removeBadgeStyles() {
 function attachObserver() {
     if (mutationObserver || typeof MutationObserver === "undefined") return;
 
-    mutationObserver = new MutationObserver(() => scheduleRefresh());
+    mutationObserver = new MutationObserver(() => {
+        // The observer has to watch the whole document (Discord's own DOM structure
+        // gives us no safe, stable, narrower container to scope to), so it fires on
+        // every DOM change app-wide - typing elsewhere, other channels' messages,
+        // tooltips, etc. Bailing out here before touching the debounce timer avoids
+        // that overhead entirely whenever the plugin isn't even relevant, instead of
+        // only bailing out later inside refreshHighlights() after the timer already fired.
+        if (!settings.store.enabled || !isInTargetForumContext()) return;
+        scheduleRefresh();
+    });
     mutationObserver.observe(document.body, {
         childList: true,
         subtree: true,
@@ -1484,7 +1629,7 @@ function detachObserver() {
 
 function attachHeartbeat() {
     if (heartbeatTimer != null) return;
-    heartbeatTimer = window.setInterval(() => scheduleRefresh(), 30000);
+    heartbeatTimer = window.setInterval(() => scheduleRefresh(), TIMING.heartbeatIntervalMs);
 }
 
 function detachHeartbeat() {
@@ -1565,6 +1710,18 @@ function unmountDriver() {
     mountNode = null;
 }
 
+function buildViolationNoticeContext(thread: any, record: ThreadRecord): ViolationNoticeContext {
+    const firstMessage = getFirstForumMessage(thread.id);
+    const cooldownViolation = buildCooldownViolation(record);
+    return {
+        threadId: thread.id,
+        threadTitle: thread.name ?? "",
+        authorId: firstMessage?.author?.id ?? "",
+        authorName: firstMessage?.author?.username ?? firstMessage?.author?.globalName ?? "",
+        violations: cooldownViolation ? [cooldownViolation, ...record.violations] : record.violations,
+    };
+}
+
 const patchThreadContextMenu: NavContextMenuPatchCallback = (children: any, { channel }: any) => {
     if (!settings.store.enabled) return;
 
@@ -1573,18 +1730,30 @@ const patchThreadContextMenu: NavContextMenuPatchCallback = (children: any, { ch
     if (thread.parent_id !== FIXED_IDS.forumChannelId || thread.getGuildId() !== FIXED_IDS.guildId) return;
 
     const record = renderedRecords.get(thread.id);
-    if (!record?.duplicateSourceThreadId) return;
+    if (!record) return;
 
-    const sourceThread = ChannelStore.getChannel(record.duplicateSourceThreadId);
-    if (!sourceThread?.isForumPost?.()) return;
+    if (record.duplicateSourceThreadId) {
+        const sourceThread = ChannelStore.getChannel(record.duplicateSourceThreadId);
+        if (sourceThread?.isForumPost?.()) {
+            children.push(
+                <Menu.MenuItem
+                    id="vc-pl5-open-previous-duplicate"
+                    label="Go to previous duplicate post"
+                    action={() => ChannelRouter.transitionToThread(sourceThread)}
+                />
+            );
+        }
+    }
 
-    children.push(
-        <Menu.MenuItem
-            id="vc-pl5-open-previous-duplicate"
-            label="Go to previous duplicate post"
-            action={() => ChannelRouter.transitionToThread(sourceThread)}
-        />
-    );
+    if (record.violations.length || record.highlight === "duplicate") {
+        children.push(
+            <Menu.MenuItem
+                id="vc-pl5-copy-violation-text"
+                label="Copy violation notice…"
+                action={() => openViolationTextModal(buildViolationNoticeContext(thread, record))}
+            />
+        );
+    }
 };
 
 export default definePlugin({
@@ -1597,9 +1766,6 @@ export default definePlugin({
         },
     ],
     settings,
-    contextMenus: {
-        "thread-context": patchThreadContextMenu,
-    },
 
     start() {
         logDebug("start()");
@@ -1627,14 +1793,34 @@ export default definePlugin({
 
         renderedRecords.clear();
         postTextCache.clear();
+        ruleViolationsCache.clear();
         inviteGuildIdCache.clear();
         inviteResolutionRetryState.clear();
         inviteResolutionQueue.length = 0;
         queuedOrResolvingInviteCodes.clear();
         activeInviteResolutions = 0;
+        messageFetchRetryState.clear();
+        messageFetchQueue.length = 0;
+        queuedOrFetchingMessageThreadIds.clear();
+        activeMessageFetches = 0;
         similarityCache.clear();
-        duplicateHistory = [];
-        duplicateHistorySignature = "";
-        emitDuplicateHistory();
+        // duplicateHistory is intentionally left alone here (and persisted to
+        // localStorage on every update) so the log survives a plugin restart
+        // instead of resetting to empty every time the plugin is toggled/reloaded.
+    },
+
+    commands: [
+        {
+            name: "view-duplicate-history",
+            description: "View the history of recent duplicate posts",
+            inputType: ApplicationCommandInputType.BUILT_IN,
+            options: [],
+            execute() {
+                openDuplicateHistoryModal();
+            },
+        }
+    ],
+    contextMenus: {
+        "thread-context": patchThreadContextMenu,
     },
 });
