@@ -4,123 +4,23 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+import { ApplicationCommandInputType } from "@api/Commands";
 import { NavContextMenuPatchCallback } from "@api/ContextMenu";
 import { definePluginSettings } from "@api/Settings";
 import definePlugin, { OptionType } from "@utils/types";
-import { ChannelRouter, ChannelStore, createRoot, InviteActions, Menu, MessageStore, React, SelectedChannelStore, useStateFromStores } from "@webpack/common";
+import { Button, ChannelRouter, ChannelStore, createRoot, Menu, MessageActions, MessageStore, React, SelectedChannelStore, useStateFromStores } from "@webpack/common";
 import type { Root } from "react-dom/client";
 
+import { BADGE_STYLE_ID, CACHE_KEYS, COLORS, FIXED_IDS, LIMITS, LOG_PREFIX, PATTERNS, TIMING } from "./constants";
+import { openDuplicateHistoryModal } from "./DuplicateModal";
 import { checkRules, type RuleCheckOptions, type RuleViolation } from "./rules";
-import trackedGuildList from "./trackedGuilds.json";
-
-const FIXED_IDS = {
-    guildId: "553917324340625424",
-    forumChannelId: "1210394762268643328",
-} as const;
-
-const COLORS = {
-    duplicate: 0xff6b6b,
-    duplicateWarning: 0xfacc15,
-    unique: 0x4ade80,
-    targetInviteGuild: 0x00e5ff,
-    violation: 0x00e5ff,
-} as const;
-
-const LIMITS = {
-    duplicateWindowMinutes: {
-        default: 720,
-        min: 1,
-        max: 10080,
-    },
-    warningDuplicateThresholdMinutes: {
-        default: 3,
-        min: 1,
-        max: 1440,
-    },
-    trackedListRefreshMinutes: {
-        default: 15,
-        min: 1,
-        max: 1440,
-    },
-    maxConcurrentInviteResolutions: 4,
-    inviteResolutionRetry: {
-        // Exponential backoff for failed invite resolutions (expired/invalid invite,
-        // transient network error, Discord API rate limit, etc). Previously a single
-        // failure permanently marked a post as "not a target guild" for the rest of
-        // the session; this lets it keep retrying at an increasing interval instead.
-        baseMs: 10_000,
-        maxMs: 5 * 60_000,
-    },
-} as const;
+import type { DuplicateHistoryEntry, ForumCardMatch, MatchEvaluation, MatchReason, RecordSummary, ThreadRecord, ViolationNoticeContext } from "./types";
+import { openViolationTextModal } from "./ViolationModal";
 
 const FALLBACKS = {
     similarityThreshold: 75,
-    targetInviteGuildIds: normalizeGuildIds(trackedGuildList?.guildIds),
 } as const;
 
-const CACHE_KEYS = {
-    trackedGuildList: "vc-pl5-tracked-guild-list-v1",
-} as const;
-
-const PATTERNS = {
-    discordInvite: /(?:https?:\/\/)?(?:www\.)?(?:discord\.gg|discord(?:app)?\.com\/invite)\/([a-zA-Z0-9-]+)/i,
-    snowflake: /\d{17,20}/g,
-} as const;
-
-type HighlightState = "duplicate" | "unique" | "targetInviteGuild" | "violation";
-type MatchReason = "title" | "invite" | "content";
-
-interface ThreadRecord {
-    threadId: string;
-    createdAt: number;
-    title: string;
-    inviteCode: string;
-    inviteGuildId: string;
-    contentSnippet: string;
-    highlight: HighlightState;
-    duplicateUntil: number | null;
-    duplicateSourceThreadId: string | null;
-    matchedPreviousThreadId: string | null;
-    matchedPreviousDeltaMs: number | null;
-    matchedPreviousTitle: string;
-    matchedReasons: MatchReason[];
-    matchedContentSimilarity: number | null;
-    excludedByPattern: boolean;
-    violations: RuleViolation[];
-}
-
-interface MatchEvaluation {
-    matched: boolean;
-    reasons: MatchReason[];
-    contentSimilarity: number | null;
-}
-
-interface DuplicateHistoryEntry {
-    threadId: string;
-    sourceThreadId: string;
-    threadTitle: string;
-    sourceTitle: string;
-    deltaMs: number;
-    reasons: MatchReason[];
-    contentSimilarity: number | null;
-    createdAt: number;
-}
-
-interface ForumCardMatch {
-    element: HTMLElement;
-    threadId: string;
-}
-
-interface RecordSummary {
-    threadId: string;
-    title: string;
-}
-
-interface TrackedGuildListCache {
-    guildIds: string[];
-    updatedAt: number;
-    sourceUrl: string;
-}
 
 const settings = definePluginSettings({
     enabled: {
@@ -132,26 +32,6 @@ const settings = definePluginSettings({
         type: OptionType.BOOLEAN,
         default: true,
         description: "Apply green tint to unique posts",
-    },
-    trackedGuildListUrl: {
-        type: OptionType.STRING,
-        default: "https://raw.githubusercontent.com/iBreeilyRBLX/Pl5PostDuplicateHighlighter/refs/heads/master/trackedGuilds.json",
-        placeholder: "https://raw.githubusercontent.com/<owner>/<repo>/<branch>/trackedGuilds.json",
-        description: "Optional URL to fetch tracked invite (Blacklisted Factions) guild IDs (falls back to bundled list if unavailable)",
-    },
-    trackedGuildListRefreshMinutes: {
-        type: OptionType.NUMBER,
-        default: LIMITS.trackedListRefreshMinutes.default,
-        description: "How often to refresh tracked invite guild IDs from URL (minutes)",
-        isValid(value: number) {
-            const numericValue = Number(value);
-            if (!Number.isFinite(numericValue)) return "Enter a valid number of minutes";
-            if (numericValue < LIMITS.trackedListRefreshMinutes.min || numericValue > LIMITS.trackedListRefreshMinutes.max) {
-                return `Value must be between ${LIMITS.trackedListRefreshMinutes.min} and ${LIMITS.trackedListRefreshMinutes.max} minutes`;
-            }
-
-            return true;
-        },
     },
     warningDuplicateThresholdMinutes: {
         type: OptionType.NUMBER,
@@ -260,7 +140,11 @@ const settings = definePluginSettings({
     duplicateHistoryPanel: {
         type: OptionType.COMPONENT,
         description: "Recent duplicate matches",
-        component: () => <DuplicateHistoryPanel />,
+        component: () => (
+            <Button size={Button.Sizes.SMALL} onClick={openDuplicateHistoryModal}>
+                Open duplicate history
+            </Button>
+        ),
     },
     debugLogs: {
         type: OptionType.BOOLEAN,
@@ -276,39 +160,47 @@ let scanQueued = false;
 let refreshTimer: number | null = null;
 let heartbeatTimer: number | null = null;
 let renderedRecords = new Map<string, ThreadRecord>();
-let duplicateHistory: DuplicateHistoryEntry[] = [];
-let duplicateHistorySignature = "";
+// Lets buildThreadRecords() skip its full rebuild (duplicate matching, rule checks,
+// similarity scoring) when nothing about the underlying thread/message data or the
+// settings that affect it has actually changed since the last scan. Without this,
+// every DOM-only mutation (e.g. the forum's virtualized list mounting/unmounting
+// cards while scrolling) re-triggers the observer and pays for a full rebuild even
+// though renderedRecords would come out identical.
+let lastRecordsSignature = "";
+export let duplicateHistory: DuplicateHistoryEntry[] = readDuplicateHistoryCache();
+let duplicateHistorySignature = computeDuplicateHistorySignature(duplicateHistory);
 const duplicateHistoryListeners = new Set<() => void>();
-const postTextCache = new Map<string, { firstMessageId: string; content: string; inviteCode: string; inviteGuildId: string; }>();
-// Only ever holds CONFIRMED resolutions (a real guild id, or "" for "resolved, no guild").
-// Codes that are pending, queued, or have failed and are awaiting retry are intentionally
-// absent from this map so callers can tell "not yet known" apart from "confirmed empty".
-const inviteGuildIdCache = new Map<string, string>();
-// Backoff bookkeeping for invite codes that have failed to resolve at least once.
-const inviteResolutionRetryState = new Map<string, { failCount: number; nextRetryAt: number; }>();
-// Bounded-concurrency queue so a burst of new posts doesn't fire dozens of simultaneous
-// resolveInvite calls at once and trip Discord's rate limiting.
-const inviteResolutionQueue: string[] = [];
-const queuedOrResolvingInviteCodes = new Set<string>();
-let activeInviteResolutions = 0;
+const postTextCache = new Map<string, { firstMessageId: string; content: string; inviteCode: string; }>();
+// checkRules() runs a dozen-plus regexes (title quality, invite counting, and
+// especially the C2-11 AI-signal detector) over full post content. Without this
+// cache it re-ran on every thread on every scan - every mutation-observer tick and
+// every 30s heartbeat - even when nothing about that post had changed, which was a
+// major source of the "laggy while browsing the forum" cost. Keyed by thread id;
+// invalidated when the first message, title, tags, or rule settings actually change.
+const ruleViolationsCache = new Map<string, { firstMessageId: string; rawTitle: string; appliedTagsKey: string; optionsKey: string; violations: RuleViolation[]; }>();
+// Backoff bookkeeping for threads whose first message failed to fetch at least once.
+const messageFetchRetryState = new Map<string, { failCount: number; nextRetryAt: number; }>();
+// Bounded-concurrency queue for proactively fetching a forum thread's first message
+// when it isn't already cached client-side (e.g. right after a restart, or for a post
+// the officer hasn't opened yet) - without this, duplicate/violation checks that need
+// message content, and history entries that need the author, silently fall back to
+// empty/"Unknown" until someone happens to open the thread.
+const messageFetchQueue: string[] = [];
+const queuedOrFetchingMessageThreadIds = new Set<string>();
+let activeMessageFetches = 0;
 const similarityCache = new Map<string, number>();
-const trackedInviteGuildIds = new Set(FALLBACKS.targetInviteGuildIds);
-let trackedGuildListRefreshTimer: number | null = null;
-let trackedGuildListLastSource: "remote" | "cache" | "fallback" = "fallback";
-let trackedGuildListLastUpdatedAt = 0;
-let trackedGuildListFetchInFlight = false;
 let excludeRegexCacheSource = "";
 let excludeRegexCache: RegExp | null = null;
 
 function logDebug(message: string, ...args: any[]) {
     if (!settings.store.debugLogs) return;
-    console.log("[Pl5PostDuplicateHighlighter]", message, ...args);
+    console.log(LOG_PREFIX, message, ...args);
 }
 
 function logDebugGroup(title: string, entries: Array<() => void>) {
     if (!settings.store.debugLogs) return;
 
-    console.groupCollapsed(`[Pl5PostDuplicateHighlighter] ${title}`);
+    console.groupCollapsed(`${LOG_PREFIX} ${title}`);
     try {
         for (const entry of entries) entry();
     } finally {
@@ -316,7 +208,75 @@ function logDebugGroup(title: string, entries: Array<() => void>) {
     }
 }
 
-function subscribeDuplicateHistory(listener: () => void) {
+function isDuplicateHistoryEntry(value: unknown): value is DuplicateHistoryEntry {
+    if (!value || typeof value !== "object") return false;
+
+    const entry = value as Partial<DuplicateHistoryEntry>;
+    return typeof entry.threadId === "string"
+        && typeof entry.sourceThreadId === "string"
+        && typeof entry.createdAt === "number"
+        && Array.isArray(entry.reasons)
+        && Array.isArray(entry.violations);
+}
+
+function readDuplicateHistoryCache(): DuplicateHistoryEntry[] {
+    try {
+        const raw = localStorage.getItem(CACHE_KEYS.duplicateHistory);
+        if (!raw) return [];
+
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) return [];
+
+        return parsed.filter(isDuplicateHistoryEntry).slice(0, LIMITS.duplicateHistoryMaxEntries);
+    } catch {
+        return [];
+    }
+}
+
+function writeDuplicateHistoryCache(history: DuplicateHistoryEntry[]) {
+    try {
+        localStorage.setItem(CACHE_KEYS.duplicateHistory, JSON.stringify(history));
+    } catch {
+        // Ignore storage failures (quota exceeded, private browsing, etc).
+    }
+}
+
+function computeDuplicateHistorySignature(history: DuplicateHistoryEntry[]) {
+    return history.map(entry => `${entry.threadId}:${entry.sourceThreadId}:${entry.createdAt}`).join("|");
+}
+
+function mergeDuplicateHistoryEntry(previous: DuplicateHistoryEntry, incoming: DuplicateHistoryEntry): DuplicateHistoryEntry {
+    // Prefer the freshly-computed entry, but a scan that ran before this thread's first
+    // message was cached (author "Unknown", empty snippet/invite) shouldn't clobber
+    // better data an earlier scan already recorded for the same thread.
+    return {
+        ...incoming,
+        authorName: incoming.authorName && incoming.authorName !== "Unknown" ? incoming.authorName : previous.authorName,
+        authorId: incoming.authorId || previous.authorId,
+        contentSnippet: incoming.contentSnippet || previous.contentSnippet,
+        inviteCode: incoming.inviteCode || previous.inviteCode,
+    };
+}
+
+function mergeDuplicateHistory(existing: DuplicateHistoryEntry[], incoming: DuplicateHistoryEntry[]) {
+    const merged = new Map<string, DuplicateHistoryEntry>();
+
+    // Persisted entries first, then let a freshly-computed entry for the same thread
+    // overwrite it with up-to-date data. This is what makes the log survive a plugin
+    // or Discord restart instead of resetting to only whatever's currently loaded in
+    // the client's thread/message caches.
+    for (const entry of existing) merged.set(entry.threadId, entry);
+    for (const entry of incoming) {
+        const previous = merged.get(entry.threadId);
+        merged.set(entry.threadId, previous ? mergeDuplicateHistoryEntry(previous, entry) : entry);
+    }
+
+    return [...merged.values()]
+        .sort((left, right) => right.createdAt - left.createdAt)
+        .slice(0, LIMITS.duplicateHistoryMaxEntries);
+}
+
+export function subscribeDuplicateHistory(listener: () => void) {
     duplicateHistoryListeners.add(listener);
     return () => {
         duplicateHistoryListeners.delete(listener);
@@ -415,87 +375,6 @@ function extractInviteCode(content: string) {
     return inviteMatch?.[1].toLowerCase() ?? "";
 }
 
-function normalizeGuildIds(rawIds: unknown) {
-    if (!Array.isArray(rawIds)) return [];
-
-    const seen = new Set<string>();
-    for (const value of rawIds) {
-        const guildId = String(value ?? "").trim();
-        if (!/^\d{17,20}$/.test(guildId)) continue;
-        seen.add(guildId);
-    }
-
-    return [...seen];
-}
-
-function setTrackedInviteGuildIds(guildIds: string[], source: "remote" | "cache" | "fallback", updatedAt = Date.now()) {
-    const normalized = normalizeGuildIds(guildIds);
-    const nextIds = normalized.length ? normalized : [...FALLBACKS.targetInviteGuildIds];
-    const previousSignature = [...trackedInviteGuildIds].sort().join("|");
-    const nextSignature = [...nextIds].sort().join("|");
-
-    trackedInviteGuildIds.clear();
-    for (const guildId of nextIds) {
-        trackedInviteGuildIds.add(guildId);
-    }
-
-    trackedGuildListLastSource = source;
-    trackedGuildListLastUpdatedAt = updatedAt;
-
-    if (previousSignature !== nextSignature) {
-        logDebug("Tracked guild list updated", {
-            source,
-            count: trackedInviteGuildIds.size,
-            sample: [...trackedInviteGuildIds].slice(0, 5),
-        });
-        scheduleRefresh();
-    }
-}
-
-function readTrackedGuildListCache() {
-    try {
-        const raw = localStorage.getItem(CACHE_KEYS.trackedGuildList);
-        if (!raw) return null;
-
-        const parsed = JSON.parse(raw) as TrackedGuildListCache;
-        if (!parsed || typeof parsed !== "object") return null;
-
-        const sourceUrl = typeof parsed.sourceUrl === "string" ? parsed.sourceUrl : "";
-        const updatedAt = Number(parsed.updatedAt);
-        const guildIds = normalizeGuildIds(parsed.guildIds);
-        if (!sourceUrl || !guildIds.length) return null;
-
-        return {
-            sourceUrl,
-            updatedAt: Number.isFinite(updatedAt) ? updatedAt : Date.now(),
-            guildIds,
-        } as TrackedGuildListCache;
-    } catch {
-        return null;
-    }
-}
-
-function writeTrackedGuildListCache(cache: TrackedGuildListCache) {
-    try {
-        localStorage.setItem(CACHE_KEYS.trackedGuildList, JSON.stringify(cache));
-    } catch {
-        // Ignore storage failures.
-    }
-}
-
-function getTrackedGuildListUrl() {
-    return String(settings.store.trackedGuildListUrl ?? "").trim();
-}
-
-function getTrackedGuildListRefreshMs() {
-    const minutes = Number(settings.store.trackedGuildListRefreshMinutes);
-    const safeMinutes = Number.isFinite(minutes)
-        ? Math.min(LIMITS.trackedListRefreshMinutes.max, Math.max(LIMITS.trackedListRefreshMinutes.min, minutes))
-        : LIMITS.trackedListRefreshMinutes.default;
-
-    return safeMinutes * 60 * 1000;
-}
-
 function getRuleCheckOptions(): RuleCheckOptions {
     return {
         multipleInvites: settings.store.ruleMultipleInvites,
@@ -504,6 +383,40 @@ function getRuleCheckOptions(): RuleCheckOptions {
         aiDisclosure: settings.store.ruleUndisclosedAi,
         aiSignalThreshold: Number(settings.store.aiSignalThreshold) || 3,
     };
+}
+
+function getCachedRuleViolations(
+    threadId: string,
+    rawTitle: string,
+    content: string,
+    appliedTags: string[],
+    firstMessageId: string,
+    options: RuleCheckOptions,
+): RuleViolation[] {
+    const appliedTagsKey = appliedTags.join(",");
+    const optionsKey = `${options.multipleInvites}|${options.tagCheck}|${options.titleQuality}|${options.aiDisclosure}|${options.aiSignalThreshold}`;
+
+    // Don't cache the "message not loaded yet" state (empty firstMessageId) - let it
+    // keep recomputing (cheap on empty content) until the real message arrives, then
+    // start caching against its actual id.
+    if (!firstMessageId) {
+        return checkRules({ rawTitle, content, appliedTags }, options);
+    }
+
+    const cached = ruleViolationsCache.get(threadId);
+    if (
+        cached
+        && cached.firstMessageId === firstMessageId
+        && cached.rawTitle === rawTitle
+        && cached.appliedTagsKey === appliedTagsKey
+        && cached.optionsKey === optionsKey
+    ) {
+        return cached.violations;
+    }
+
+    const violations = checkRules({ rawTitle, content, appliedTags }, options);
+    ruleViolationsCache.set(threadId, { firstMessageId, rawTitle, appliedTagsKey, optionsKey, violations });
+    return violations;
 }
 
 function getWarningDuplicateThresholdMs() {
@@ -515,161 +428,58 @@ function getWarningDuplicateThresholdMs() {
     return safeMinutes * 60 * 1000;
 }
 
-async function refreshTrackedGuildListFromRemote() {
-    if (trackedGuildListFetchInFlight) return;
+function scheduleFirstMessageFetch(threadId: string) {
+    if (!threadId) return;
+    if (queuedOrFetchingMessageThreadIds.has(threadId)) return;
 
-    const url = getTrackedGuildListUrl();
-    if (!url) {
-        setTrackedInviteGuildIds(FALLBACKS.targetInviteGuildIds, "fallback");
-        return;
-    }
-
-    trackedGuildListFetchInFlight = true;
-    try {
-        const response = await fetch(url, {
-            cache: "no-store",
-        });
-
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
-        }
-
-        const payload = await response.json();
-        const fromObject = payload?.guildIds;
-        const guildIds = normalizeGuildIds(Array.isArray(payload) ? payload : fromObject);
-        if (!guildIds.length) {
-            throw new Error("Remote list was empty or invalid");
-        }
-
-        const updatedAt = Date.now();
-        setTrackedInviteGuildIds(guildIds, "remote", updatedAt);
-        writeTrackedGuildListCache({
-            sourceUrl: url,
-            updatedAt,
-            guildIds,
-        });
-    } catch (error) {
-        logDebug("Failed to refresh tracked guild list", {
-            error,
-            source: trackedGuildListLastSource,
-            cachedCount: trackedInviteGuildIds.size,
-        });
-
-        if (!trackedInviteGuildIds.size) {
-            setTrackedInviteGuildIds(FALLBACKS.targetInviteGuildIds, "fallback");
-        }
-    } finally {
-        trackedGuildListFetchInFlight = false;
-    }
-}
-
-function initializeTrackedGuildList() {
-    const url = getTrackedGuildListUrl();
-    if (!url) {
-        setTrackedInviteGuildIds(FALLBACKS.targetInviteGuildIds, "fallback");
-        return;
-    }
-
-    const cache = readTrackedGuildListCache();
-    if (cache && cache.sourceUrl === url) {
-        setTrackedInviteGuildIds(cache.guildIds, "cache", cache.updatedAt);
-    } else {
-        setTrackedInviteGuildIds(FALLBACKS.targetInviteGuildIds, "fallback");
-    }
-
-    void refreshTrackedGuildListFromRemote();
-}
-
-function attachTrackedGuildListRefresh() {
-    detachTrackedGuildListRefresh();
-
-    const url = getTrackedGuildListUrl();
-    if (!url) return;
-
-    trackedGuildListRefreshTimer = window.setInterval(() => {
-        void refreshTrackedGuildListFromRemote();
-    }, getTrackedGuildListRefreshMs());
-}
-
-function detachTrackedGuildListRefresh() {
-    if (trackedGuildListRefreshTimer != null) {
-        clearInterval(trackedGuildListRefreshTimer);
-        trackedGuildListRefreshTimer = null;
-    }
-}
-
-function isTargetInviteGuild(guildId: string) {
-    return guildId ? trackedInviteGuildIds.has(guildId) : false;
-}
-
-function scheduleInviteGuildResolution(inviteCode: string) {
-    const normalizedCode = inviteCode.toLowerCase();
-    if (!normalizedCode) return;
-    if (inviteGuildIdCache.has(normalizedCode)) return;
-    if (queuedOrResolvingInviteCodes.has(normalizedCode)) return;
-
-    const retryState = inviteResolutionRetryState.get(normalizedCode);
+    const retryState = messageFetchRetryState.get(threadId);
     if (retryState && retryState.nextRetryAt > Date.now()) return;
 
-    queuedOrResolvingInviteCodes.add(normalizedCode);
-    inviteResolutionQueue.push(normalizedCode);
-    pumpInviteResolutionQueue();
+    queuedOrFetchingMessageThreadIds.add(threadId);
+    messageFetchQueue.push(threadId);
+    pumpMessageFetchQueue();
 }
 
-function pumpInviteResolutionQueue() {
-    while (activeInviteResolutions < LIMITS.maxConcurrentInviteResolutions && inviteResolutionQueue.length) {
-        const normalizedCode = inviteResolutionQueue.shift();
-        if (normalizedCode == null) break;
-        void resolveInviteGuildId(normalizedCode);
+function pumpMessageFetchQueue() {
+    while (activeMessageFetches < LIMITS.maxConcurrentMessageFetches && messageFetchQueue.length) {
+        const threadId = messageFetchQueue.shift();
+        if (threadId == null) break;
+        void fetchFirstMessage(threadId);
     }
 }
 
-async function resolveInviteGuildId(normalizedCode: string) {
-    activeInviteResolutions++;
+async function fetchFirstMessage(threadId: string) {
+    activeMessageFetches++;
     try {
-        const result: any = await InviteActions.resolveInvite(normalizedCode, "Pl5PostDuplicateHighlighter");
-        const guildId = result?.invite?.guild?.id;
-        // Confirmed resolution: either a real guild id, or "" meaning the invite is
-        // valid but isn't attached to a guild (e.g. a group DM invite). Either way we
-        // now know the answer and don't need to retry it again.
-        inviteGuildIdCache.set(normalizedCode, typeof guildId === "string" ? guildId : "");
-        inviteResolutionRetryState.delete(normalizedCode);
+        // Forum threads are typically short, so the latest `limit` messages almost
+        // always include the opening post; this mirrors the fetchMessages usage
+        // elsewhere in Vencord rather than reaching for a lower-level API.
+        await MessageActions.fetchMessages({ channelId: threadId, limit: 50 });
+        messageFetchRetryState.delete(threadId);
     } catch (error) {
-        // Resolution failed (expired/invalid invite, transient network error, rate
-        // limit, etc). Do NOT cache this as a confirmed "no guild" - that previously
-        // caused posts to permanently lose eligibility for the tracked-guild highlight
-        // after a single hiccup. Instead, back off and let a later scan retry it.
-        const previousFailCount = inviteResolutionRetryState.get(normalizedCode)?.failCount ?? 0;
+        const previousFailCount = messageFetchRetryState.get(threadId)?.failCount ?? 0;
         const failCount = previousFailCount + 1;
         const backoffMs = Math.min(
-            LIMITS.inviteResolutionRetry.maxMs,
-            LIMITS.inviteResolutionRetry.baseMs * (2 ** (failCount - 1)),
+            LIMITS.messageFetchRetry.maxMs,
+            LIMITS.messageFetchRetry.baseMs * (2 ** (failCount - 1)),
         );
 
-        inviteResolutionRetryState.set(normalizedCode, {
+        messageFetchRetryState.set(threadId, {
             failCount,
             nextRetryAt: Date.now() + backoffMs,
         });
 
-        logDebug("Invite resolution failed, will retry with backoff", {
-            normalizedCode,
+        logDebug("First-message fetch failed, will retry with backoff", {
+            threadId,
             failCount,
             backoffMs,
             error,
         });
     } finally {
-        queuedOrResolvingInviteCodes.delete(normalizedCode);
-        activeInviteResolutions--;
-
-        const resolvedGuildId = inviteGuildIdCache.get(normalizedCode) ?? "";
-        for (const cached of postTextCache.values()) {
-            if (cached.inviteCode === normalizedCode) {
-                cached.inviteGuildId = resolvedGuildId;
-            }
-        }
-
+        queuedOrFetchingMessageThreadIds.delete(threadId);
+        activeMessageFetches--;
         scheduleRefresh();
-        pumpInviteResolutionQueue();
+        pumpMessageFetchQueue();
     }
 }
 
@@ -727,10 +537,6 @@ function hexToRgba(hexColor: number, alpha: number) {
 }
 
 function getHighlightColor(record: ThreadRecord) {
-    if (record.highlight === "targetInviteGuild") {
-        return COLORS.targetInviteGuild;
-    }
-
     if (record.highlight === "violation") {
         return COLORS.violation;
     }
@@ -826,50 +632,33 @@ function isInTargetForumContext() {
 function getPostText(channelId: string) {
     const message = getFirstForumMessage(channelId);
     if (!message) {
-        return { content: "", inviteCode: "", inviteGuildId: "" };
+        // Message not cached client-side yet (e.g. right after a restart). Queue a
+        // fetch so content/invite/author data backfills on a later scan instead of
+        // staying empty until someone happens to open the thread.
+        scheduleFirstMessageFetch(channelId);
+        return { content: "", inviteCode: "" };
     }
 
     const cached = postTextCache.get(channelId);
     if (cached && cached.firstMessageId === message.id) {
-        if (cached.inviteCode && !cached.inviteGuildId) {
-            if (inviteGuildIdCache.has(cached.inviteCode)) {
-                cached.inviteGuildId = inviteGuildIdCache.get(cached.inviteCode) ?? "";
-            } else {
-                // Previously this branch never re-scheduled resolution, so once a post's
-                // first message was cached (true for almost every scan after the first),
-                // a still-unresolved invite would never get another resolution attempt -
-                // it silently sat at "" forever even after the queue/backoff above would
-                // otherwise have retried it. Re-arm it here on every cache-hit scan.
-                scheduleInviteGuildResolution(cached.inviteCode);
-            }
-        }
-
         return {
             content: cached.content,
             inviteCode: cached.inviteCode,
-            inviteGuildId: cached.inviteGuildId,
         };
     }
 
     const content = typeof message.content === "string" ? message.content : "";
     const inviteCode = extractInviteCode(content);
-    const inviteGuildId = inviteCode ? (inviteGuildIdCache.get(inviteCode) ?? "") : "";
-
-    if (inviteCode && !inviteGuildIdCache.has(inviteCode)) {
-        scheduleInviteGuildResolution(inviteCode);
-    }
 
     postTextCache.set(channelId, {
         firstMessageId: message.id,
         content,
         inviteCode,
-        inviteGuildId,
     });
 
     return {
         content,
         inviteCode,
-        inviteGuildId,
     };
 }
 
@@ -929,7 +718,7 @@ function evaluateMatch(
             let similarity = similarityCache.get(similarityCacheKey);
             if (similarity == null) {
                 similarity = levenshteinSimilarity(left.contentSnippet, right.contentSnippet);
-                if (similarityCache.size > 4000) {
+                if (similarityCache.size > LIMITS.similarityCacheMaxEntries) {
                     similarityCache.clear();
                 }
                 similarityCache.set(similarityCacheKey, similarity);
@@ -962,21 +751,15 @@ function getDuplicateInfo(record: ThreadRecord, previousRecords: ThreadRecord[],
     let matchedReasons: MatchReason[] = [];
     let matchedContentSimilarity: number | null = null;
 
-    const markDuplicate = (previous: ThreadRecord, match: MatchEvaluation) => {
-        const expiresAt = previous.createdAt + windowMs;
-        if (duplicateUntil == null || expiresAt > duplicateUntil) {
-            duplicateUntil = expiresAt;
-            duplicateSourceThreadId = previous.threadId;
-
-            if (matchedPreviousThreadId == null) {
-                matchedPreviousThreadId = previous.threadId;
-                matchedPreviousDeltaMs = Math.max(0, record.createdAt - previous.createdAt);
-                matchedPreviousTitle = previous.title;
-                matchedReasons = [...match.reasons];
-                matchedContentSimilarity = match.contentSimilarity;
-            }
-        }
-    };
+    // activeRecords is always built as a chronological suffix of previousRecords (see
+    // buildThreadRecords: both are pushed to together, activeRecords just also shifts
+    // off its front past the cutoff), so every element in it also appears in
+    // previousRecords. A single pass - checking active-window membership as we go -
+    // covers what used to be two separate loops, each calling evaluateMatch() again
+    // for anything inside the duplicate window, doubling that work for no difference
+    // in output (matchedPrevious* always resolves to the same nearest match either
+    // way, since it's a pure function of the (record, previous) pair).
+    const activeSet = new Set(activeRecords);
 
     for (const previous of previousRecords) {
         const match = evaluateMatch(record, previous, titleEnabled, inviteEnabled, contentEnabled, similarityThreshold);
@@ -992,12 +775,13 @@ function getDuplicateInfo(record: ThreadRecord, previousRecords: ThreadRecord[],
             matchedReasons = [...match.reasons];
             matchedContentSimilarity = match.contentSimilarity;
         }
-    }
 
-    for (const previous of activeRecords) {
-        const match = evaluateMatch(record, previous, titleEnabled, inviteEnabled, contentEnabled, similarityThreshold);
-        if (match.matched) {
-            markDuplicate(previous, match);
+        if (activeSet.has(previous)) {
+            const expiresAt = previous.createdAt + windowMs;
+            if (duplicateUntil == null || expiresAt > duplicateUntil) {
+                duplicateUntil = expiresAt;
+                duplicateSourceThreadId = previous.threadId;
+            }
         }
     }
 
@@ -1013,7 +797,7 @@ function getDuplicateInfo(record: ThreadRecord, previousRecords: ThreadRecord[],
     };
 }
 
-function formatDuration(ms: number) {
+export function formatDuration(ms: number) {
     const safe = Math.max(0, ms);
     if (safe <= 0) return "0m";
 
@@ -1024,6 +808,45 @@ function formatDuration(ms: number) {
     if (hours > 0 && minutes > 0) return `${hours}h ${minutes}m`;
     if (hours > 0) return `${hours}h`;
     return `${totalMinutes}m`;
+}
+
+// Prose duration for violation-notice text, e.g. "1 hour and 24 minutes" /
+// "45 minutes", matching the wording used in the C2 warning templates.
+function formatDurationWords(ms: number) {
+    const totalMinutes = Math.max(0, Math.round(ms / 60000));
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+
+    const hourPart = hours > 0 ? `${hours} hour${hours === 1 ? "" : "s"}` : "";
+    const minutePart = minutes > 0 ? `${minutes} minute${minutes === 1 ? "" : "s"}` : "";
+
+    if (hourPart && minutePart) return `${hourPart} and ${minutePart}`;
+    return hourPart || minutePart || "0 minutes";
+}
+
+function formatCooldownWindowLabel(ms: number) {
+    const totalMinutes = Math.max(0, Math.round(ms / 60000));
+    if (totalMinutes > 0 && totalMinutes % 60 === 0) {
+        return `${totalMinutes / 60}-hour cooldown`;
+    }
+
+    return `${formatDurationWords(ms)} cooldown`;
+}
+
+// C2-2: re-posting before the duplicate window (cooldown) has elapsed. This isn't
+// one of the rules.ts content checks - it's derived from the duplicate match itself -
+// so it's synthesized here rather than returned from checkRules().
+function buildCooldownViolation(record: ThreadRecord): RuleViolation | null {
+    if (record.highlight !== "duplicate" || record.matchedPreviousDeltaMs == null) return null;
+
+    const windowMs = getDuplicateWindowMs();
+    const earlyByMs = Math.max(0, windowMs - record.matchedPreviousDeltaMs);
+    if (earlyByMs <= 0) return null;
+
+    return {
+        code: "C2-2",
+        summary: `Posting ${formatDurationWords(earlyByMs)} early from ${formatCooldownWindowLabel(windowMs)}`,
+    };
 }
 
 function applyExpiryTooltip(element: HTMLElement, record: ThreadRecord) {
@@ -1072,11 +895,46 @@ function applyExpiryTooltip(element: HTMLElement, record: ThreadRecord) {
     element.setAttribute("title", tooltipLines.join(" | "));
 }
 
+function computeRecordsSignature(threads: any[]) {
+    // Everything here that can change what buildThreadRecords() produces has to be
+    // part of the signature, or a settings/content change could get silently skipped
+    // until some unrelated thread mutation happens to invalidate the cache.
+    const settingsKey = [
+        getDuplicateWindowMs(),
+        getWarningDuplicateThresholdMs(),
+        settings.store.excludePatternRegex,
+        settings.store.checkTitle,
+        settings.store.checkInvite,
+        settings.store.checkContent,
+        settings.store.similarityThreshold,
+        settings.store.ruleMultipleInvites,
+        settings.store.ruleMissingTags,
+        settings.store.ruleTitleQuality,
+        settings.store.ruleUndisclosedAi,
+        settings.store.aiSignalThreshold,
+    ].join("|");
+
+    const threadsKey = threads
+        .map((thread: any) => `${thread.id}:${thread.lastMessageId ?? ""}:${thread.messageCount ?? 0}:${MessageStore.getMessages(thread.id)?._array.length ?? 0}:${((thread as any).appliedTags ?? []).join(",")}`)
+        .join("|");
+
+    return `${settingsKey}::${threadsKey}`;
+}
+
 function buildThreadRecords() {
     const windowMs = getDuplicateWindowMs();
     const threads = ChannelStore.getAllThreadsForParent(FIXED_IDS.forumChannelId)
         .filter((channel: any) => channel?.isForumPost?.() && channel.getGuildId() === FIXED_IDS.guildId)
         .sort((left: any, right: any) => getThreadCreatedAt(left) - getThreadCreatedAt(right));
+
+    const signature = computeRecordsSignature(threads);
+    if (signature === lastRecordsSignature) {
+        logDebug("buildThreadRecords skipped: no relevant change since last scan", {
+            totalThreads: threads.length,
+        });
+        return;
+    }
+    lastRecordsSignature = signature;
 
     const activeRecords: ThreadRecord[] = [];
     const previousRecords: ThreadRecord[] = [];
@@ -1095,7 +953,6 @@ function buildThreadRecords() {
             createdAt,
             title: normalizeTitle(thread.name ?? ""),
             inviteCode: "",
-            inviteGuildId: "",
             contentSnippet: "",
             highlight: "unique",
             duplicateUntil: null,
@@ -1109,25 +966,22 @@ function buildThreadRecords() {
             violations: [],
         };
 
-        const { content, inviteCode, inviteGuildId } = getPostText(thread.id);
+        const { content, inviteCode } = getPostText(thread.id);
         record.inviteCode = inviteCode;
-        record.inviteGuildId = inviteGuildId;
         record.contentSnippet = normalizeContent(content);
-        record.violations = checkRules({
-            rawTitle: thread.name ?? "",
-            content,
-            appliedTags: Array.isArray((thread as any).appliedTags)
-                ? (thread as any).appliedTags.map(String)
-                : [],
-        }, getRuleCheckOptions());
 
-        if (isTargetInviteGuild(record.inviteGuildId)) {
-            record.highlight = "targetInviteGuild";
-            nextRecords.set(thread.id, record);
-            previousRecords.push(record);
-            activeRecords.push(record);
-            continue;
-        }
+        const appliedTags = Array.isArray((thread as any).appliedTags)
+            ? (thread as any).appliedTags.map(String)
+            : [];
+        const firstMessageId = postTextCache.get(thread.id)?.firstMessageId ?? "";
+        record.violations = getCachedRuleViolations(
+            thread.id,
+            thread.name ?? "",
+            content,
+            appliedTags,
+            firstMessageId,
+            getRuleCheckOptions(),
+        );
 
         const excludeRegex = getExcludeRegex();
         if (excludeRegex && (excludeRegex.test(record.title) || excludeRegex.test(record.contentSnippet))) {
@@ -1137,8 +991,8 @@ function buildThreadRecords() {
         }
 
         const duplicateInfo = getDuplicateInfo(record, previousRecords, activeRecords, windowMs);
-        // Tint priority: tracked guild > duplicate > violation > unique.
-        // Violations on tracked/duplicate posts still surface via badge + tooltip.
+        // Tint priority: duplicate > violation > unique.
+        // Violations on duplicate posts still surface via badge + tooltip.
         record.highlight = duplicateInfo.isDuplicate
             ? "duplicate"
             : record.violations.length
@@ -1160,28 +1014,46 @@ function buildThreadRecords() {
 
     renderedRecords = nextRecords;
 
-    const history = [...nextRecords.values()]
+    const liveHistory = [...nextRecords.values()]
         .filter(record => record.highlight === "duplicate" && record.matchedPreviousThreadId && record.matchedPreviousDeltaMs != null)
         .sort((left, right) => right.createdAt - left.createdAt)
-        .slice(0, 50)
         .map(record => {
             const source = nextRecords.get(record.matchedPreviousThreadId!) ?? null;
+            const firstMessage = getFirstForumMessage(record.threadId);
+            const authorName = firstMessage?.author?.username ?? firstMessage?.author?.globalName ?? "Unknown";
+            const authorId = firstMessage?.author?.id ?? "";
+            // Every entry here is by definition a cooldown violation (that's what
+            // "duplicate" means), so this is always attached alongside any rules.ts
+            // violations - it's what makes "Copy violation notice" show for these.
+            const cooldownViolation = buildCooldownViolation(record);
+            const violations = cooldownViolation ? [cooldownViolation, ...record.violations] : record.violations;
             return {
                 threadId: record.threadId,
                 sourceThreadId: record.matchedPreviousThreadId!,
-                threadTitle: record.title,
-                sourceTitle: source?.title ?? "",
+                threadTitle: ChannelStore.getChannel(record.threadId)?.name ?? record.title,
+                sourceTitle: ChannelStore.getChannel(record.matchedPreviousThreadId!)?.name ?? source?.title ?? "",
                 deltaMs: record.matchedPreviousDeltaMs!,
                 reasons: record.matchedReasons,
                 contentSimilarity: record.matchedContentSimilarity,
                 createdAt: record.createdAt,
+                authorName,
+                authorId,
+                contentSnippet: record.contentSnippet,
+                inviteCode: record.inviteCode,
+                violations,
+                excludedByPattern: record.excludedByPattern,
             } as DuplicateHistoryEntry;
         });
 
-    const historySignature = history.map(entry => `${entry.threadId}:${entry.sourceThreadId}:${entry.createdAt}`).join("|");
+    // Merge into (rather than replace) the persisted log, so entries survive a plugin
+    // or Discord restart even before the client has reloaded every thread/message that
+    // originally fed a match.
+    const history = mergeDuplicateHistory(duplicateHistory, liveHistory);
+    const historySignature = computeDuplicateHistorySignature(history);
     if (historySignature !== duplicateHistorySignature) {
         duplicateHistorySignature = historySignature;
         duplicateHistory = history;
+        writeDuplicateHistoryCache(history);
         emitDuplicateHistory();
     }
 
@@ -1195,7 +1067,6 @@ function buildThreadRecords() {
                 highlight: r.highlight,
                 title: r.title,
                 inviteCode: r.inviteCode,
-                inviteGuildId: r.inviteGuildId,
                 contentSnippet: r.contentSnippet,
             }));
             logDebug("recordSample", sample);
@@ -1203,11 +1074,36 @@ function buildThreadRecords() {
     ]);
 }
 
-function getForumCardMatches(): ForumCardMatch[] {
+function getForumCardMatchesFast(): ForumCardMatch[] | null {
+    // Forum post cards consistently render with a `mainCard_<hash>` class in every
+    // build we've observed (the `<hash>` suffix is a per-release webpack module id
+    // and changes across Discord updates, but the `mainCard_` prefix - derived from
+    // the source SCSS module name - doesn't). Querying for it directly is far
+    // narrower than scanning every heading in the entire app and walking back up
+    // from each one, which is what the fallback below has to do because it has no
+    // more specific hook to start from.
+    const candidates = document.querySelectorAll<HTMLElement>("[class*='mainCard_']");
+    if (!candidates.length) return null;
+
+    const cards = new Map<string, ForumCardMatch>();
+    for (const candidate of candidates) {
+        const threadId = getThreadIdFromElementData(candidate);
+        // getThreadIdFromElementData() only ever resolves to an id already present in
+        // renderedRecords (see extractKnownThreadIdFromText), so a false-positive
+        // match here (some other, unrelated "mainCard_" element) can't slip through -
+        // it just fails to resolve and gets skipped, same as it would in the fallback.
+        if (threadId) cards.set(threadId, { element: candidate, threadId });
+    }
+
+    // If the class matched something but resolved none of our threads, don't trust
+    // it - fall through to the heading scan rather than reporting zero cards.
+    return cards.size ? [...cards.values()] : null;
+}
+
+function getForumCardMatchesViaHeadings(): ForumCardMatch[] {
     const cards = new Map<string, ForumCardMatch>();
     const headings = document.querySelectorAll<HTMLElement>("[role='heading'], h1, h2, h3, h4, h5, h6");
     const titleToThreadId = new Map<string, string>();
-    const debugSamples: Array<{ heading: string; parsedThreadId: string | null; }> = [];
 
     const summaries: RecordSummary[] = [...renderedRecords.values()].map(record => ({
         threadId: record.threadId,
@@ -1229,30 +1125,25 @@ function getForumCardMatches(): ForumCardMatch[] {
         }
         if (!threadId) continue;
 
-        if (debugSamples.length < 10) {
-            debugSamples.push({
-                heading: (heading.textContent ?? "").trim(),
-                parsedThreadId: threadId,
-            });
-        }
-
         cards.set(threadId, { element: card, threadId });
     }
 
-    const result = [...cards.values()];
-
-    logDebugGroup("getForumCardMatches", [
-        () => logDebug("headingCount", headings.length),
-        () => logDebug("matchedCards", result.length),
-        () => logDebug("matchedThreadIds", result.slice(0, 20).map(c => c.threadId)),
-    ]);
-
-    // Plain log to avoid losing key info in collapsed groups.
-    logDebug("getForumCardMatches summary", {
+    logDebug("getForumCardMatches fallback (heading scan)", {
         headingCount: headings.length,
+        matchedCards: cards.size,
+    });
+
+    return [...cards.values()];
+}
+
+function getForumCardMatches(): ForumCardMatch[] {
+    const fast = getForumCardMatchesFast();
+    const result = fast ?? getForumCardMatchesViaHeadings();
+
+    logDebug("getForumCardMatches summary", {
+        usedFastPath: fast != null,
         matchedCards: result.length,
         sampleThreadIds: result.slice(0, 5).map(c => c.threadId),
-        sampleMatches: debugSamples,
     });
 
     return result;
@@ -1287,7 +1178,38 @@ function removeViolationBadge(element: HTMLElement) {
     }
 }
 
+function computeCardSignature(record: ThreadRecord) {
+    // Everything applyHighlightToCard/applyViolationBadge/applyExpiryTooltip read to
+    // decide what to write to the DOM has to be part of this, plus the threadId - the
+    // forum's virtualized list recycles DOM nodes for different posts as you scroll,
+    // so without threadId a coincidental match could skip writing a different post's
+    // data onto a reused element.
+    return [
+        record.threadId,
+        record.highlight,
+        settings.store.tintUniquePosts,
+        settings.store.showViolationBadge,
+        settings.store.showExpiryTooltip,
+        record.excludedByPattern,
+        record.violations.map(violation => `${violation.code}:${violation.summary}`).join(","),
+        record.matchedPreviousDeltaMs,
+        record.matchedReasons.join(","),
+        record.matchedContentSimilarity,
+        getDuplicateWindowMs(),
+        getWarningDuplicateThresholdMs(),
+    ].join("|");
+}
+
 function applyHighlightToCard(element: HTMLElement, record: ThreadRecord) {
+    // The forum's virtualized list keeps re-mounting/unmounting cards as you scroll,
+    // which retriggers a scan even though nothing about the underlying data changed.
+    // Skip redoing the style/badge/tooltip writes when this exact element already has
+    // this exact record's output applied - avoids needless layout/paint work and, with
+    // debug logging on, a console.log per already-correct card on every single scan.
+    const signature = computeCardSignature(record);
+    if (element.dataset.vcPl5Signature === signature) return;
+    element.dataset.vcPl5Signature = signature;
+
     if (record.highlight === "unique" && !settings.store.tintUniquePosts) {
         element.dataset.vcPl5PostDuplicateHighlighter = record.highlight;
         element.style.removeProperty("background-color");
@@ -1302,11 +1224,9 @@ function applyHighlightToCard(element: HTMLElement, record: ThreadRecord) {
 
     const color = getHighlightColor(record);
     const rgb = `#${color.toString(16).padStart(6, "0")}`;
-    const translucent = record.highlight === "targetInviteGuild"
-        ? hexToRgba(color, 0.28)
-        : record.highlight === "violation"
-            ? hexToRgba(color, 0.16)
-            : hexToRgba(color, 0.12);
+    const translucent = record.highlight === "violation"
+        ? hexToRgba(color, 0.16)
+        : hexToRgba(color, 0.12);
 
     element.dataset.vcPl5PostDuplicateHighlighter = record.highlight;
     setCardStyle(element, "background-color", translucent);
@@ -1330,21 +1250,13 @@ function clearHighlightFromCard(element: HTMLElement) {
     if (!element.dataset.vcPl5PostDuplicateHighlighter) return;
 
     delete element.dataset.vcPl5PostDuplicateHighlighter;
+    delete element.dataset.vcPl5Signature;
     removeViolationBadge(element);
-    const targets: HTMLElement[] = [element];
-
-    // Legacy cleanup: previous versions also tinted parent/child containers.
-    if (element.parentElement) targets.push(element.parentElement);
-    const firstChild = element.firstElementChild;
-    if (firstChild instanceof HTMLElement) targets.push(firstChild);
-
-    for (const target of targets) {
-        target.style.removeProperty("background-color");
-        target.style.removeProperty("border-color");
-        target.style.removeProperty("border-style");
-        target.style.removeProperty("border-width");
-        target.style.removeProperty("box-shadow");
-    }
+    element.style.removeProperty("background-color");
+    element.style.removeProperty("border-color");
+    element.style.removeProperty("border-style");
+    element.style.removeProperty("border-width");
+    element.style.removeProperty("box-shadow");
 
     if (element.dataset.vcPl5HadTitle === "1") {
         element.setAttribute("title", element.dataset.vcPl5OriginalTitle ?? "");
@@ -1360,6 +1272,10 @@ function refreshHighlights() {
             clearHighlightFromCard(element);
         }
         renderedRecords.clear();
+        // Force the next buildThreadRecords() call (once re-enabled) to do a real
+        // rebuild instead of comparing against a signature computed before we went
+        // idle, which could otherwise match and leave renderedRecords empty.
+        lastRecordsSignature = "";
         return;
     }
 
@@ -1402,9 +1318,6 @@ function refreshHighlights() {
         () => logDebug("enabled", settings.store.enabled),
         () => logDebug("inTargetForumContext", isInTargetForumContext()),
         () => logDebug("tintUniquePosts", settings.store.tintUniquePosts),
-        () => logDebug("trackedGuildListSource", trackedGuildListLastSource),
-        () => logDebug("trackedGuildListUpdatedAt", trackedGuildListLastUpdatedAt),
-        () => logDebug("trackedGuildCount", trackedInviteGuildIds.size),
         () => logDebug("renderedRecords", renderedRecords.size),
         () => logDebug("applied", applied),
         () => logDebug("cleared", cleared),
@@ -1426,12 +1339,10 @@ function scheduleRefresh() {
         try {
             refreshHighlights();
         } catch (error) {
-            console.error("[Pl5PostDuplicateHighlighter] Failed to refresh forum highlights", error);
+            console.error(`${LOG_PREFIX} Failed to refresh forum highlights`, error);
         }
-    }, 80);
+    }, TIMING.refreshDebounceMs);
 }
-
-const BADGE_STYLE_ID = "vc-pl5-post-duplicate-highlighter-badge-style";
 
 function injectBadgeStyles() {
     if (document.getElementById(BADGE_STYLE_ID)) return;
@@ -1465,7 +1376,16 @@ function removeBadgeStyles() {
 function attachObserver() {
     if (mutationObserver || typeof MutationObserver === "undefined") return;
 
-    mutationObserver = new MutationObserver(() => scheduleRefresh());
+    mutationObserver = new MutationObserver(() => {
+        // The observer has to watch the whole document (Discord's own DOM structure
+        // gives us no safe, stable, narrower container to scope to), so it fires on
+        // every DOM change app-wide - typing elsewhere, other channels' messages,
+        // tooltips, etc. Bailing out here before touching the debounce timer avoids
+        // that overhead entirely whenever the plugin isn't even relevant, instead of
+        // only bailing out later inside refreshHighlights() after the timer already fired.
+        if (!settings.store.enabled || !isInTargetForumContext()) return;
+        scheduleRefresh();
+    });
     mutationObserver.observe(document.body, {
         childList: true,
         subtree: true,
@@ -1484,7 +1404,13 @@ function detachObserver() {
 
 function attachHeartbeat() {
     if (heartbeatTimer != null) return;
-    heartbeatTimer = window.setInterval(() => scheduleRefresh(), 30000);
+    heartbeatTimer = window.setInterval(() => {
+        // Mirror the mutation observer's bail-out: no point even queuing a debounced
+        // scan (and the isInTargetForumContext() check refreshHighlights() would do
+        // anyway) when we're not somewhere the plugin is relevant.
+        if (!settings.store.enabled || !isInTargetForumContext()) return;
+        scheduleRefresh();
+    }, TIMING.heartbeatIntervalMs);
 }
 
 function detachHeartbeat() {
@@ -1497,8 +1423,6 @@ function detachHeartbeat() {
 function Driver() {
     settings.use([
         "enabled",
-        "trackedGuildListUrl",
-        "trackedGuildListRefreshMinutes",
         "warningDuplicateThresholdMinutes",
         "duplicateWindowMinutes",
         "excludePatternRegex",
@@ -1534,15 +1458,6 @@ function Driver() {
         scheduleRefresh();
     }, []);
 
-    React.useEffect(() => {
-        initializeTrackedGuildList();
-        attachTrackedGuildListRefresh();
-        return () => detachTrackedGuildListRefresh();
-    }, [
-        settings.store.trackedGuildListUrl,
-        settings.store.trackedGuildListRefreshMinutes,
-    ]);
-
     return null;
 }
 
@@ -1565,6 +1480,18 @@ function unmountDriver() {
     mountNode = null;
 }
 
+function buildViolationNoticeContext(thread: any, record: ThreadRecord): ViolationNoticeContext {
+    const firstMessage = getFirstForumMessage(thread.id);
+    const cooldownViolation = buildCooldownViolation(record);
+    return {
+        threadId: thread.id,
+        threadTitle: thread.name ?? "",
+        authorId: firstMessage?.author?.id ?? "",
+        authorName: firstMessage?.author?.username ?? firstMessage?.author?.globalName ?? "",
+        violations: cooldownViolation ? [cooldownViolation, ...record.violations] : record.violations,
+    };
+}
+
 const patchThreadContextMenu: NavContextMenuPatchCallback = (children: any, { channel }: any) => {
     if (!settings.store.enabled) return;
 
@@ -1573,18 +1500,30 @@ const patchThreadContextMenu: NavContextMenuPatchCallback = (children: any, { ch
     if (thread.parent_id !== FIXED_IDS.forumChannelId || thread.getGuildId() !== FIXED_IDS.guildId) return;
 
     const record = renderedRecords.get(thread.id);
-    if (!record?.duplicateSourceThreadId) return;
+    if (!record) return;
 
-    const sourceThread = ChannelStore.getChannel(record.duplicateSourceThreadId);
-    if (!sourceThread?.isForumPost?.()) return;
+    if (record.duplicateSourceThreadId) {
+        const sourceThread = ChannelStore.getChannel(record.duplicateSourceThreadId);
+        if (sourceThread?.isForumPost?.()) {
+            children.push(
+                <Menu.MenuItem
+                    id="vc-pl5-open-previous-duplicate"
+                    label="Go to previous duplicate post"
+                    action={() => ChannelRouter.transitionToThread(sourceThread)}
+                />
+            );
+        }
+    }
 
-    children.push(
-        <Menu.MenuItem
-            id="vc-pl5-open-previous-duplicate"
-            label="Go to previous duplicate post"
-            action={() => ChannelRouter.transitionToThread(sourceThread)}
-        />
-    );
+    if (record.violations.length || record.highlight === "duplicate") {
+        children.push(
+            <Menu.MenuItem
+                id="vc-pl5-copy-violation-text"
+                label="Copy violation notice…"
+                action={() => openViolationTextModal(buildViolationNoticeContext(thread, record))}
+            />
+        );
+    }
 };
 
 export default definePlugin({
@@ -1597,9 +1536,6 @@ export default definePlugin({
         },
     ],
     settings,
-    contextMenus: {
-        "thread-context": patchThreadContextMenu,
-    },
 
     start() {
         logDebug("start()");
@@ -1614,7 +1550,6 @@ export default definePlugin({
         logDebug("stop()");
         detachObserver();
         detachHeartbeat();
-        detachTrackedGuildListRefresh();
         unmountDriver();
 
         for (const element of document.querySelectorAll<HTMLElement>("[data-vc-pl5-post-duplicate-highlighter]")) {
@@ -1626,15 +1561,31 @@ export default definePlugin({
         removeBadgeStyles();
 
         renderedRecords.clear();
+        lastRecordsSignature = "";
         postTextCache.clear();
-        inviteGuildIdCache.clear();
-        inviteResolutionRetryState.clear();
-        inviteResolutionQueue.length = 0;
-        queuedOrResolvingInviteCodes.clear();
-        activeInviteResolutions = 0;
+        ruleViolationsCache.clear();
+        messageFetchRetryState.clear();
+        messageFetchQueue.length = 0;
+        queuedOrFetchingMessageThreadIds.clear();
+        activeMessageFetches = 0;
         similarityCache.clear();
-        duplicateHistory = [];
-        duplicateHistorySignature = "";
-        emitDuplicateHistory();
+        // duplicateHistory is intentionally left alone here (and persisted to
+        // localStorage on every update) so the log survives a plugin restart
+        // instead of resetting to empty every time the plugin is toggled/reloaded.
+    },
+
+    commands: [
+        {
+            name: "view-duplicate-history",
+            description: "View the history of recent duplicate posts",
+            inputType: ApplicationCommandInputType.BUILT_IN,
+            options: [],
+            execute() {
+                openDuplicateHistoryModal();
+            },
+        }
+    ],
+    contextMenus: {
+        "thread-context": patchThreadContextMenu,
     },
 });

@@ -122,6 +122,10 @@ const RHETORICAL_HOOK = /^(?:looking for|tired of|sick of|bored of|searching for
 // <:name:id> and intentionally NOT matched here).
 const LEADING_EMOJI = /^\s*([\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u2714\u2705\u2611])/u;
 
+const HORIZONTAL_RULE = /^\s*(?:-{3,}|_{3,}|\*{3,}|={3,})\s*$/;
+const CHECKMARK_BULLET = /^\s*[\u2714\u2705\u2611]/;
+const COLON_LABEL_LINE = /^[A-Za-z][A-Za-z' ]{2,40}:$/;
+
 // Community artifact markers: evidence the post was assembled inside a real
 // server. LLMs cannot fabricate valid custom emoji IDs, Discord timestamps,
 // or CDN attachment links.
@@ -187,14 +191,6 @@ function hasUniformParagraphs(content: string): boolean {
     return Math.sqrt(variance) / mean < 0.25;
 }
 
-function hasExcessiveCaps(title: string) {
-    const letters = title.replace(/[^a-z]/gi, "");
-    if (letters.length < 10) return false;
-
-    const uppercase = letters.replace(/[^A-Z]/g, "").length;
-    return uppercase / letters.length >= 0.75;
-}
-
 function collectAiSignals(content: string): AiSignal[] {
     const signals: AiSignal[] = [];
     const lines = content.split("\n");
@@ -252,18 +248,13 @@ function collectAiSignals(content: string): AiSignal[] {
     }
 
     // ════ STRUCTURAL TELLS - suppressed for community-artifact posts ════
-    // Decorated markdown templates (headings, dividers, emoji bullets) are
-    // normal HUMAN faction-ad culture on this forum. These only ever fire
-    // on posts with no custom emoji, no timestamps, no attachment links -
-    // i.e. bare text an LLM could have produced wholesale.
+    // Decorated markdown templates (dividers, emoji bullets) are normal HUMAN
+    // faction-ad culture on this forum. These only ever fire on posts with no
+    // custom emoji, no timestamps, no attachment links - i.e. bare text an
+    // LLM could have produced wholesale.
 
     if (!isCommunityArtifact) {
-        const markdownHeadingCount = lines.filter(line => /^#{1,3}\s+\S/.test(line)).length;
-        if (markdownHeadingCount >= 3) {
-            signals.push({ points: 1, label: `${markdownHeadingCount} markdown # headings` });
-        }
-
-        const horizontalRuleCount = lines.filter(line => /^\s*(?:-{3,}|_{3,}|\*{3,}|={3,})\s*$/.test(line)).length;
+        const horizontalRuleCount = lines.filter(line => HORIZONTAL_RULE.test(line)).length;
         if (horizontalRuleCount >= 1) {
             signals.push({ points: 1, label: "horizontal-rule dividers (not rendered by Discord)" });
         }
@@ -292,13 +283,13 @@ function collectAiSignals(content: string): AiSignal[] {
                 : { points: 1, label: "emoji section headers (no custom server emoji)" });
         }
 
-        const checkmarkLines = lines.filter(line => /^\s*[\u2714\u2705\u2611]/.test(line)).length;
+        const checkmarkLines = lines.filter(line => CHECKMARK_BULLET.test(line)).length;
         if (checkmarkLines >= 3) {
             signals.push({ points: 1, label: `checkmark bullet list (${checkmarkLines} lines)` });
         }
 
         // Short standalone "What we offer:" style labels with no formatting.
-        const colonLabelLines = lines.filter(line => /^[A-Za-z][A-Za-z' ]{2,40}:$/.test(line.trim()));
+        const colonLabelLines = lines.filter(line => COLON_LABEL_LINE.test(line.trim()));
         if (colonLabelLines.length >= 2) {
             signals.push({ points: 1, label: "plain-text section labels ending in colon" });
         }
@@ -329,7 +320,6 @@ function checkTitleQuality(rawTitle: string): RuleViolation | null {
     if (FANCY_LETTERS.test(rawTitle) || ZALGO.test(rawTitle)) issues.push("custom unicode letters");
     if (DECORATIVE_SYMBOLS.test(rawTitle)) issues.push("decorative symbols");
     if (SENSATIONAL.test(rawTitle)) issues.push("sensationalist language");
-    if (hasExcessiveCaps(rawTitle)) issues.push("excessive caps");
     if (EXCESSIVE_PUNCTUATION.test(rawTitle)) issues.push("excessive punctuation");
 
     if (!issues.length) return null;
