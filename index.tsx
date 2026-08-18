@@ -1079,11 +1079,36 @@ function buildThreadRecords() {
     ]);
 }
 
-function getForumCardMatches(): ForumCardMatch[] {
+function getForumCardMatchesFast(): ForumCardMatch[] | null {
+    // Forum post cards consistently render with a `mainCard_<hash>` class in every
+    // build we've observed (the `<hash>` suffix is a per-release webpack module id
+    // and changes across Discord updates, but the `mainCard_` prefix - derived from
+    // the source SCSS module name - doesn't). Querying for it directly is far
+    // narrower than scanning every heading in the entire app and walking back up
+    // from each one, which is what the fallback below has to do because it has no
+    // more specific hook to start from.
+    const candidates = document.querySelectorAll<HTMLElement>("[class*='mainCard_']");
+    if (!candidates.length) return null;
+
+    const cards = new Map<string, ForumCardMatch>();
+    for (const candidate of candidates) {
+        const threadId = getThreadIdFromElementData(candidate);
+        // getThreadIdFromElementData() only ever resolves to an id already present in
+        // renderedRecords (see extractKnownThreadIdFromText), so a false-positive
+        // match here (some other, unrelated "mainCard_" element) can't slip through -
+        // it just fails to resolve and gets skipped, same as it would in the fallback.
+        if (threadId) cards.set(threadId, { element: candidate, threadId });
+    }
+
+    // If the class matched something but resolved none of our threads, don't trust
+    // it - fall through to the heading scan rather than reporting zero cards.
+    return cards.size ? [...cards.values()] : null;
+}
+
+function getForumCardMatchesViaHeadings(): ForumCardMatch[] {
     const cards = new Map<string, ForumCardMatch>();
     const headings = document.querySelectorAll<HTMLElement>("[role='heading'], h1, h2, h3, h4, h5, h6");
     const titleToThreadId = new Map<string, string>();
-    const debugSamples: Array<{ heading: string; parsedThreadId: string | null; }> = [];
 
     const summaries: RecordSummary[] = [...renderedRecords.values()].map(record => ({
         threadId: record.threadId,
@@ -1105,30 +1130,25 @@ function getForumCardMatches(): ForumCardMatch[] {
         }
         if (!threadId) continue;
 
-        if (debugSamples.length < 10) {
-            debugSamples.push({
-                heading: (heading.textContent ?? "").trim(),
-                parsedThreadId: threadId,
-            });
-        }
-
         cards.set(threadId, { element: card, threadId });
     }
 
-    const result = [...cards.values()];
-
-    logDebugGroup("getForumCardMatches", [
-        () => logDebug("headingCount", headings.length),
-        () => logDebug("matchedCards", result.length),
-        () => logDebug("matchedThreadIds", result.slice(0, 20).map(c => c.threadId)),
-    ]);
-
-    // Plain log to avoid losing key info in collapsed groups.
-    logDebug("getForumCardMatches summary", {
+    logDebug("getForumCardMatches fallback (heading scan)", {
         headingCount: headings.length,
+        matchedCards: cards.size,
+    });
+
+    return [...cards.values()];
+}
+
+function getForumCardMatches(): ForumCardMatch[] {
+    const fast = getForumCardMatchesFast();
+    const result = fast ?? getForumCardMatchesViaHeadings();
+
+    logDebug("getForumCardMatches summary", {
+        usedFastPath: fast != null,
         matchedCards: result.length,
         sampleThreadIds: result.slice(0, 5).map(c => c.threadId),
-        sampleMatches: debugSamples,
     });
 
     return result;
@@ -1389,7 +1409,13 @@ function detachObserver() {
 
 function attachHeartbeat() {
     if (heartbeatTimer != null) return;
-    heartbeatTimer = window.setInterval(() => scheduleRefresh(), TIMING.heartbeatIntervalMs);
+    heartbeatTimer = window.setInterval(() => {
+        // Mirror the mutation observer's bail-out: no point even queuing a debounced
+        // scan (and the isInTargetForumContext() check refreshHighlights() would do
+        // anyway) when we're not somewhere the plugin is relevant.
+        if (!settings.store.enabled || !isInTargetForumContext()) return;
+        scheduleRefresh();
+    }, TIMING.heartbeatIntervalMs);
 }
 
 function detachHeartbeat() {
