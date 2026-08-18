@@ -6,7 +6,7 @@
 
 import type { RuleViolation } from "./rules";
 
-export type HighlightState = "duplicate" | "unique" | "targetInviteGuild" | "violation";
+export type HighlightState = "duplicate" | "unique" | "violation";
 export type MatchReason = "title" | "invite" | "content";
 
 export interface ThreadRecord {
@@ -14,7 +14,6 @@ export interface ThreadRecord {
     createdAt: number;
     title: string;
     inviteCode: string;
-    inviteGuildId: string;
     contentSnippet: string;
     highlight: HighlightState;
     duplicateUntil: number | null;
@@ -61,12 +60,6 @@ export interface ForumCardMatch {
 export interface RecordSummary {
     threadId: string;
     title: string;
-}
-
-export interface TrackedGuildListCache {
-    guildIds: string[];
-    updatedAt: number;
-    sourceUrl: string;
 }
 
 export interface ViolationNoticeContext {

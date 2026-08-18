@@ -9,10 +9,7 @@ It also flags posts that appear to violate the Conduct 2 Advertising Guidelines 
 - **C2-5/C2-7** — title uses custom unicode letters/fonts, decorative symbols, sensationalist language, excessive caps, or excessive punctuation
 - **C2-11** — post looks AI-written (em-dashes, typographic quotes, AI-typical phrasing, templated formatting) with no plain-text AI disclosure
 
-Tint priority is: tracked (blacklisted) guild > duplicate > violation > unique. The violation badge and tooltip still appear on tracked/duplicate posts. Each rule can be toggled in plugin settings, and the C2-11 signal threshold is adjustable (higher = fewer false positives). These are heuristics meant to aid manual review, not verdicts.
-
-Note that this plugin does collect live data from this repo [located here](https://raw.githubusercontent.com/iBreeilyRBLX/Pl5PostDuplicateHighlighter/refs/heads/master/trackedGuilds.json)
-If you wish to turn this settings off them put the "Tracked Guild List Url" to Blank.
+Tint priority is: duplicate > violation > unique. The violation badge and tooltip still appear on duplicate posts. Each rule can be toggled in plugin settings, and the C2-11 signal threshold is adjustable (higher = fewer false positives). These are heuristics meant to aid manual review, not verdicts.
 
 ## First Time Setup
 

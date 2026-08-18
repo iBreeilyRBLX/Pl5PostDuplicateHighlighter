@@ -8,19 +8,17 @@ import { ApplicationCommandInputType } from "@api/Commands";
 import { NavContextMenuPatchCallback } from "@api/ContextMenu";
 import { definePluginSettings } from "@api/Settings";
 import definePlugin, { OptionType } from "@utils/types";
-import { Button, ChannelRouter, ChannelStore, createRoot, InviteActions, Menu, MessageActions, MessageStore, React, SelectedChannelStore, useStateFromStores } from "@webpack/common";
+import { Button, ChannelRouter, ChannelStore, createRoot, Menu, MessageActions, MessageStore, React, SelectedChannelStore, useStateFromStores } from "@webpack/common";
 import type { Root } from "react-dom/client";
 
 import { BADGE_STYLE_ID, CACHE_KEYS, COLORS, FIXED_IDS, LIMITS, LOG_PREFIX, PATTERNS, TIMING } from "./constants";
 import { openDuplicateHistoryModal } from "./DuplicateModal";
 import { checkRules, type RuleCheckOptions, type RuleViolation } from "./rules";
-import trackedGuildList from "./trackedGuilds.json";
-import type { DuplicateHistoryEntry, ForumCardMatch, MatchEvaluation, MatchReason, RecordSummary, ThreadRecord, TrackedGuildListCache, ViolationNoticeContext } from "./types";
+import type { DuplicateHistoryEntry, ForumCardMatch, MatchEvaluation, MatchReason, RecordSummary, ThreadRecord, ViolationNoticeContext } from "./types";
 import { openViolationTextModal } from "./ViolationModal";
 
 const FALLBACKS = {
     similarityThreshold: 75,
-    targetInviteGuildIds: normalizeGuildIds(trackedGuildList?.guildIds),
 } as const;
 
 
@@ -34,26 +32,6 @@ const settings = definePluginSettings({
         type: OptionType.BOOLEAN,
         default: true,
         description: "Apply green tint to unique posts",
-    },
-    trackedGuildListUrl: {
-        type: OptionType.STRING,
-        default: "https://raw.githubusercontent.com/iBreeilyRBLX/Pl5PostDuplicateHighlighter/refs/heads/master/trackedGuilds.json",
-        placeholder: "https://raw.githubusercontent.com/<owner>/<repo>/<branch>/trackedGuilds.json",
-        description: "Optional URL to fetch tracked invite (Blacklisted Factions) guild IDs (falls back to bundled list if unavailable)",
-    },
-    trackedGuildListRefreshMinutes: {
-        type: OptionType.NUMBER,
-        default: LIMITS.trackedListRefreshMinutes.default,
-        description: "How often to refresh tracked invite guild IDs from URL (minutes)",
-        isValid(value: number) {
-            const numericValue = Number(value);
-            if (!Number.isFinite(numericValue)) return "Enter a valid number of minutes";
-            if (numericValue < LIMITS.trackedListRefreshMinutes.min || numericValue > LIMITS.trackedListRefreshMinutes.max) {
-                return `Value must be between ${LIMITS.trackedListRefreshMinutes.min} and ${LIMITS.trackedListRefreshMinutes.max} minutes`;
-            }
-
-            return true;
-        },
     },
     warningDuplicateThresholdMinutes: {
         type: OptionType.NUMBER,
@@ -182,10 +160,17 @@ let scanQueued = false;
 let refreshTimer: number | null = null;
 let heartbeatTimer: number | null = null;
 let renderedRecords = new Map<string, ThreadRecord>();
+// Lets buildThreadRecords() skip its full rebuild (duplicate matching, rule checks,
+// similarity scoring) when nothing about the underlying thread/message data or the
+// settings that affect it has actually changed since the last scan. Without this,
+// every DOM-only mutation (e.g. the forum's virtualized list mounting/unmounting
+// cards while scrolling) re-triggers the observer and pays for a full rebuild even
+// though renderedRecords would come out identical.
+let lastRecordsSignature = "";
 export let duplicateHistory: DuplicateHistoryEntry[] = readDuplicateHistoryCache();
 let duplicateHistorySignature = computeDuplicateHistorySignature(duplicateHistory);
 const duplicateHistoryListeners = new Set<() => void>();
-const postTextCache = new Map<string, { firstMessageId: string; content: string; inviteCode: string; inviteGuildId: string; }>();
+const postTextCache = new Map<string, { firstMessageId: string; content: string; inviteCode: string; }>();
 // checkRules() runs a dozen-plus regexes (title quality, invite counting, and
 // especially the C2-11 AI-signal detector) over full post content. Without this
 // cache it re-ran on every thread on every scan - every mutation-observer tick and
@@ -193,17 +178,6 @@ const postTextCache = new Map<string, { firstMessageId: string; content: string;
 // major source of the "laggy while browsing the forum" cost. Keyed by thread id;
 // invalidated when the first message, title, tags, or rule settings actually change.
 const ruleViolationsCache = new Map<string, { firstMessageId: string; rawTitle: string; appliedTagsKey: string; optionsKey: string; violations: RuleViolation[]; }>();
-// Only ever holds CONFIRMED resolutions (a real guild id, or "" for "resolved, no guild").
-// Codes that are pending, queued, or have failed and are awaiting retry are intentionally
-// absent from this map so callers can tell "not yet known" apart from "confirmed empty".
-const inviteGuildIdCache = new Map<string, string>();
-// Backoff bookkeeping for invite codes that have failed to resolve at least once.
-const inviteResolutionRetryState = new Map<string, { failCount: number; nextRetryAt: number; }>();
-// Bounded-concurrency queue so a burst of new posts doesn't fire dozens of simultaneous
-// resolveInvite calls at once and trip Discord's rate limiting.
-const inviteResolutionQueue: string[] = [];
-const queuedOrResolvingInviteCodes = new Set<string>();
-let activeInviteResolutions = 0;
 // Backoff bookkeeping for threads whose first message failed to fetch at least once.
 const messageFetchRetryState = new Map<string, { failCount: number; nextRetryAt: number; }>();
 // Bounded-concurrency queue for proactively fetching a forum thread's first message
@@ -215,11 +189,6 @@ const messageFetchQueue: string[] = [];
 const queuedOrFetchingMessageThreadIds = new Set<string>();
 let activeMessageFetches = 0;
 const similarityCache = new Map<string, number>();
-const trackedInviteGuildIds = new Set(FALLBACKS.targetInviteGuildIds);
-let trackedGuildListRefreshTimer: number | null = null;
-let trackedGuildListLastSource: "remote" | "cache" | "fallback" = "fallback";
-let trackedGuildListLastUpdatedAt = 0;
-let trackedGuildListFetchInFlight = false;
 let excludeRegexCacheSource = "";
 let excludeRegexCache: RegExp | null = null;
 
@@ -406,87 +375,6 @@ function extractInviteCode(content: string) {
     return inviteMatch?.[1].toLowerCase() ?? "";
 }
 
-function normalizeGuildIds(rawIds: unknown) {
-    if (!Array.isArray(rawIds)) return [];
-
-    const seen = new Set<string>();
-    for (const value of rawIds) {
-        const guildId = String(value ?? "").trim();
-        if (!/^\d{17,20}$/.test(guildId)) continue;
-        seen.add(guildId);
-    }
-
-    return [...seen];
-}
-
-function setTrackedInviteGuildIds(guildIds: string[], source: "remote" | "cache" | "fallback", updatedAt = Date.now()) {
-    const normalized = normalizeGuildIds(guildIds);
-    const nextIds = normalized.length ? normalized : [...FALLBACKS.targetInviteGuildIds];
-    const previousSignature = [...trackedInviteGuildIds].sort().join("|");
-    const nextSignature = [...nextIds].sort().join("|");
-
-    trackedInviteGuildIds.clear();
-    for (const guildId of nextIds) {
-        trackedInviteGuildIds.add(guildId);
-    }
-
-    trackedGuildListLastSource = source;
-    trackedGuildListLastUpdatedAt = updatedAt;
-
-    if (previousSignature !== nextSignature) {
-        logDebug("Tracked guild list updated", {
-            source,
-            count: trackedInviteGuildIds.size,
-            sample: [...trackedInviteGuildIds].slice(0, 5),
-        });
-        scheduleRefresh();
-    }
-}
-
-function readTrackedGuildListCache() {
-    try {
-        const raw = localStorage.getItem(CACHE_KEYS.trackedGuildList);
-        if (!raw) return null;
-
-        const parsed = JSON.parse(raw) as TrackedGuildListCache;
-        if (!parsed || typeof parsed !== "object") return null;
-
-        const sourceUrl = typeof parsed.sourceUrl === "string" ? parsed.sourceUrl : "";
-        const updatedAt = Number(parsed.updatedAt);
-        const guildIds = normalizeGuildIds(parsed.guildIds);
-        if (!sourceUrl || !guildIds.length) return null;
-
-        return {
-            sourceUrl,
-            updatedAt: Number.isFinite(updatedAt) ? updatedAt : Date.now(),
-            guildIds,
-        } as TrackedGuildListCache;
-    } catch {
-        return null;
-    }
-}
-
-function writeTrackedGuildListCache(cache: TrackedGuildListCache) {
-    try {
-        localStorage.setItem(CACHE_KEYS.trackedGuildList, JSON.stringify(cache));
-    } catch {
-        // Ignore storage failures.
-    }
-}
-
-function getTrackedGuildListUrl() {
-    return String(settings.store.trackedGuildListUrl ?? "").trim();
-}
-
-function getTrackedGuildListRefreshMs() {
-    const minutes = Number(settings.store.trackedGuildListRefreshMinutes);
-    const safeMinutes = Number.isFinite(minutes)
-        ? Math.min(LIMITS.trackedListRefreshMinutes.max, Math.max(LIMITS.trackedListRefreshMinutes.min, minutes))
-        : LIMITS.trackedListRefreshMinutes.default;
-
-    return safeMinutes * 60 * 1000;
-}
-
 function getRuleCheckOptions(): RuleCheckOptions {
     return {
         multipleInvites: settings.store.ruleMultipleInvites,
@@ -538,164 +426,6 @@ function getWarningDuplicateThresholdMs() {
         : LIMITS.warningDuplicateThresholdMinutes.default;
 
     return safeMinutes * 60 * 1000;
-}
-
-async function refreshTrackedGuildListFromRemote() {
-    if (trackedGuildListFetchInFlight) return;
-
-    const url = getTrackedGuildListUrl();
-    if (!url) {
-        setTrackedInviteGuildIds(FALLBACKS.targetInviteGuildIds, "fallback");
-        return;
-    }
-
-    trackedGuildListFetchInFlight = true;
-    try {
-        const response = await fetch(url, {
-            cache: "no-store",
-        });
-
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
-        }
-
-        const payload = await response.json();
-        const fromObject = payload?.guildIds;
-        const guildIds = normalizeGuildIds(Array.isArray(payload) ? payload : fromObject);
-        if (!guildIds.length) {
-            throw new Error("Remote list was empty or invalid");
-        }
-
-        const updatedAt = Date.now();
-        setTrackedInviteGuildIds(guildIds, "remote", updatedAt);
-        writeTrackedGuildListCache({
-            sourceUrl: url,
-            updatedAt,
-            guildIds,
-        });
-    } catch (error) {
-        logDebug("Failed to refresh tracked guild list", {
-            error,
-            source: trackedGuildListLastSource,
-            cachedCount: trackedInviteGuildIds.size,
-        });
-
-        if (!trackedInviteGuildIds.size) {
-            setTrackedInviteGuildIds(FALLBACKS.targetInviteGuildIds, "fallback");
-        }
-    } finally {
-        trackedGuildListFetchInFlight = false;
-    }
-}
-
-function initializeTrackedGuildList() {
-    const url = getTrackedGuildListUrl();
-    if (!url) {
-        setTrackedInviteGuildIds(FALLBACKS.targetInviteGuildIds, "fallback");
-        return;
-    }
-
-    const cache = readTrackedGuildListCache();
-    if (cache && cache.sourceUrl === url) {
-        setTrackedInviteGuildIds(cache.guildIds, "cache", cache.updatedAt);
-    } else {
-        setTrackedInviteGuildIds(FALLBACKS.targetInviteGuildIds, "fallback");
-    }
-
-    void refreshTrackedGuildListFromRemote();
-}
-
-function attachTrackedGuildListRefresh() {
-    detachTrackedGuildListRefresh();
-
-    const url = getTrackedGuildListUrl();
-    if (!url) return;
-
-    trackedGuildListRefreshTimer = window.setInterval(() => {
-        void refreshTrackedGuildListFromRemote();
-    }, getTrackedGuildListRefreshMs());
-}
-
-function detachTrackedGuildListRefresh() {
-    if (trackedGuildListRefreshTimer != null) {
-        clearInterval(trackedGuildListRefreshTimer);
-        trackedGuildListRefreshTimer = null;
-    }
-}
-
-function isTargetInviteGuild(guildId: string) {
-    return guildId ? trackedInviteGuildIds.has(guildId) : false;
-}
-
-function scheduleInviteGuildResolution(inviteCode: string) {
-    const normalizedCode = inviteCode.toLowerCase();
-    if (!normalizedCode) return;
-    if (inviteGuildIdCache.has(normalizedCode)) return;
-    if (queuedOrResolvingInviteCodes.has(normalizedCode)) return;
-
-    const retryState = inviteResolutionRetryState.get(normalizedCode);
-    if (retryState && retryState.nextRetryAt > Date.now()) return;
-
-    queuedOrResolvingInviteCodes.add(normalizedCode);
-    inviteResolutionQueue.push(normalizedCode);
-    pumpInviteResolutionQueue();
-}
-
-function pumpInviteResolutionQueue() {
-    while (activeInviteResolutions < LIMITS.maxConcurrentInviteResolutions && inviteResolutionQueue.length) {
-        const normalizedCode = inviteResolutionQueue.shift();
-        if (normalizedCode == null) break;
-        void resolveInviteGuildId(normalizedCode);
-    }
-}
-
-async function resolveInviteGuildId(normalizedCode: string) {
-    activeInviteResolutions++;
-    try {
-        const result: any = await InviteActions.resolveInvite(normalizedCode, "Pl5PostDuplicateHighlighter");
-        const guildId = result?.invite?.guild?.id;
-        // Confirmed resolution: either a real guild id, or "" meaning the invite is
-        // valid but isn't attached to a guild (e.g. a group DM invite). Either way we
-        // now know the answer and don't need to retry it again.
-        inviteGuildIdCache.set(normalizedCode, typeof guildId === "string" ? guildId : "");
-        inviteResolutionRetryState.delete(normalizedCode);
-    } catch (error) {
-        // Resolution failed (expired/invalid invite, transient network error, rate
-        // limit, etc). Do NOT cache this as a confirmed "no guild" - that previously
-        // caused posts to permanently lose eligibility for the tracked-guild highlight
-        // after a single hiccup. Instead, back off and let a later scan retry it.
-        const previousFailCount = inviteResolutionRetryState.get(normalizedCode)?.failCount ?? 0;
-        const failCount = previousFailCount + 1;
-        const backoffMs = Math.min(
-            LIMITS.inviteResolutionRetry.maxMs,
-            LIMITS.inviteResolutionRetry.baseMs * (2 ** (failCount - 1)),
-        );
-
-        inviteResolutionRetryState.set(normalizedCode, {
-            failCount,
-            nextRetryAt: Date.now() + backoffMs,
-        });
-
-        logDebug("Invite resolution failed, will retry with backoff", {
-            normalizedCode,
-            failCount,
-            backoffMs,
-            error,
-        });
-    } finally {
-        queuedOrResolvingInviteCodes.delete(normalizedCode);
-        activeInviteResolutions--;
-
-        const resolvedGuildId = inviteGuildIdCache.get(normalizedCode) ?? "";
-        for (const cached of postTextCache.values()) {
-            if (cached.inviteCode === normalizedCode) {
-                cached.inviteGuildId = resolvedGuildId;
-            }
-        }
-
-        scheduleRefresh();
-        pumpInviteResolutionQueue();
-    }
 }
 
 function scheduleFirstMessageFetch(threadId: string) {
@@ -807,10 +537,6 @@ function hexToRgba(hexColor: number, alpha: number) {
 }
 
 function getHighlightColor(record: ThreadRecord) {
-    if (record.highlight === "targetInviteGuild") {
-        return COLORS.targetInviteGuild;
-    }
-
     if (record.highlight === "violation") {
         return COLORS.violation;
     }
@@ -910,50 +636,29 @@ function getPostText(channelId: string) {
         // fetch so content/invite/author data backfills on a later scan instead of
         // staying empty until someone happens to open the thread.
         scheduleFirstMessageFetch(channelId);
-        return { content: "", inviteCode: "", inviteGuildId: "" };
+        return { content: "", inviteCode: "" };
     }
 
     const cached = postTextCache.get(channelId);
     if (cached && cached.firstMessageId === message.id) {
-        if (cached.inviteCode && !cached.inviteGuildId) {
-            if (inviteGuildIdCache.has(cached.inviteCode)) {
-                cached.inviteGuildId = inviteGuildIdCache.get(cached.inviteCode) ?? "";
-            } else {
-                // Previously this branch never re-scheduled resolution, so once a post's
-                // first message was cached (true for almost every scan after the first),
-                // a still-unresolved invite would never get another resolution attempt -
-                // it silently sat at "" forever even after the queue/backoff above would
-                // otherwise have retried it. Re-arm it here on every cache-hit scan.
-                scheduleInviteGuildResolution(cached.inviteCode);
-            }
-        }
-
         return {
             content: cached.content,
             inviteCode: cached.inviteCode,
-            inviteGuildId: cached.inviteGuildId,
         };
     }
 
     const content = typeof message.content === "string" ? message.content : "";
     const inviteCode = extractInviteCode(content);
-    const inviteGuildId = inviteCode ? (inviteGuildIdCache.get(inviteCode) ?? "") : "";
-
-    if (inviteCode && !inviteGuildIdCache.has(inviteCode)) {
-        scheduleInviteGuildResolution(inviteCode);
-    }
 
     postTextCache.set(channelId, {
         firstMessageId: message.id,
         content,
         inviteCode,
-        inviteGuildId,
     });
 
     return {
         content,
         inviteCode,
-        inviteGuildId,
     };
 }
 
@@ -1195,11 +900,46 @@ function applyExpiryTooltip(element: HTMLElement, record: ThreadRecord) {
     element.setAttribute("title", tooltipLines.join(" | "));
 }
 
+function computeRecordsSignature(threads: any[]) {
+    // Everything here that can change what buildThreadRecords() produces has to be
+    // part of the signature, or a settings/content change could get silently skipped
+    // until some unrelated thread mutation happens to invalidate the cache.
+    const settingsKey = [
+        getDuplicateWindowMs(),
+        getWarningDuplicateThresholdMs(),
+        settings.store.excludePatternRegex,
+        settings.store.checkTitle,
+        settings.store.checkInvite,
+        settings.store.checkContent,
+        settings.store.similarityThreshold,
+        settings.store.ruleMultipleInvites,
+        settings.store.ruleMissingTags,
+        settings.store.ruleTitleQuality,
+        settings.store.ruleUndisclosedAi,
+        settings.store.aiSignalThreshold,
+    ].join("|");
+
+    const threadsKey = threads
+        .map((thread: any) => `${thread.id}:${thread.lastMessageId ?? ""}:${thread.messageCount ?? 0}:${MessageStore.getMessages(thread.id)?._array.length ?? 0}:${((thread as any).appliedTags ?? []).join(",")}`)
+        .join("|");
+
+    return `${settingsKey}::${threadsKey}`;
+}
+
 function buildThreadRecords() {
     const windowMs = getDuplicateWindowMs();
     const threads = ChannelStore.getAllThreadsForParent(FIXED_IDS.forumChannelId)
         .filter((channel: any) => channel?.isForumPost?.() && channel.getGuildId() === FIXED_IDS.guildId)
         .sort((left: any, right: any) => getThreadCreatedAt(left) - getThreadCreatedAt(right));
+
+    const signature = computeRecordsSignature(threads);
+    if (signature === lastRecordsSignature) {
+        logDebug("buildThreadRecords skipped: no relevant change since last scan", {
+            totalThreads: threads.length,
+        });
+        return;
+    }
+    lastRecordsSignature = signature;
 
     const activeRecords: ThreadRecord[] = [];
     const previousRecords: ThreadRecord[] = [];
@@ -1218,7 +958,6 @@ function buildThreadRecords() {
             createdAt,
             title: normalizeTitle(thread.name ?? ""),
             inviteCode: "",
-            inviteGuildId: "",
             contentSnippet: "",
             highlight: "unique",
             duplicateUntil: null,
@@ -1232,9 +971,8 @@ function buildThreadRecords() {
             violations: [],
         };
 
-        const { content, inviteCode, inviteGuildId } = getPostText(thread.id);
+        const { content, inviteCode } = getPostText(thread.id);
         record.inviteCode = inviteCode;
-        record.inviteGuildId = inviteGuildId;
         record.contentSnippet = normalizeContent(content);
 
         const appliedTags = Array.isArray((thread as any).appliedTags)
@@ -1250,14 +988,6 @@ function buildThreadRecords() {
             getRuleCheckOptions(),
         );
 
-        if (isTargetInviteGuild(record.inviteGuildId)) {
-            record.highlight = "targetInviteGuild";
-            nextRecords.set(thread.id, record);
-            previousRecords.push(record);
-            activeRecords.push(record);
-            continue;
-        }
-
         const excludeRegex = getExcludeRegex();
         if (excludeRegex && (excludeRegex.test(record.title) || excludeRegex.test(record.contentSnippet))) {
             record.excludedByPattern = true;
@@ -1266,8 +996,8 @@ function buildThreadRecords() {
         }
 
         const duplicateInfo = getDuplicateInfo(record, previousRecords, activeRecords, windowMs);
-        // Tint priority: tracked guild > duplicate > violation > unique.
-        // Violations on tracked/duplicate posts still surface via badge + tooltip.
+        // Tint priority: duplicate > violation > unique.
+        // Violations on duplicate posts still surface via badge + tooltip.
         record.highlight = duplicateInfo.isDuplicate
             ? "duplicate"
             : record.violations.length
@@ -1342,7 +1072,6 @@ function buildThreadRecords() {
                 highlight: r.highlight,
                 title: r.title,
                 inviteCode: r.inviteCode,
-                inviteGuildId: r.inviteGuildId,
                 contentSnippet: r.contentSnippet,
             }));
             logDebug("recordSample", sample);
@@ -1449,11 +1178,9 @@ function applyHighlightToCard(element: HTMLElement, record: ThreadRecord) {
 
     const color = getHighlightColor(record);
     const rgb = `#${color.toString(16).padStart(6, "0")}`;
-    const translucent = record.highlight === "targetInviteGuild"
-        ? hexToRgba(color, 0.28)
-        : record.highlight === "violation"
-            ? hexToRgba(color, 0.16)
-            : hexToRgba(color, 0.12);
+    const translucent = record.highlight === "violation"
+        ? hexToRgba(color, 0.16)
+        : hexToRgba(color, 0.12);
 
     element.dataset.vcPl5PostDuplicateHighlighter = record.highlight;
     setCardStyle(element, "background-color", translucent);
@@ -1498,6 +1225,10 @@ function refreshHighlights() {
             clearHighlightFromCard(element);
         }
         renderedRecords.clear();
+        // Force the next buildThreadRecords() call (once re-enabled) to do a real
+        // rebuild instead of comparing against a signature computed before we went
+        // idle, which could otherwise match and leave renderedRecords empty.
+        lastRecordsSignature = "";
         return;
     }
 
@@ -1540,9 +1271,6 @@ function refreshHighlights() {
         () => logDebug("enabled", settings.store.enabled),
         () => logDebug("inTargetForumContext", isInTargetForumContext()),
         () => logDebug("tintUniquePosts", settings.store.tintUniquePosts),
-        () => logDebug("trackedGuildListSource", trackedGuildListLastSource),
-        () => logDebug("trackedGuildListUpdatedAt", trackedGuildListLastUpdatedAt),
-        () => logDebug("trackedGuildCount", trackedInviteGuildIds.size),
         () => logDebug("renderedRecords", renderedRecords.size),
         () => logDebug("applied", applied),
         () => logDebug("cleared", cleared),
@@ -1642,8 +1370,6 @@ function detachHeartbeat() {
 function Driver() {
     settings.use([
         "enabled",
-        "trackedGuildListUrl",
-        "trackedGuildListRefreshMinutes",
         "warningDuplicateThresholdMinutes",
         "duplicateWindowMinutes",
         "excludePatternRegex",
@@ -1678,15 +1404,6 @@ function Driver() {
         logDebug("Driver effect scheduleRefresh()");
         scheduleRefresh();
     }, []);
-
-    React.useEffect(() => {
-        initializeTrackedGuildList();
-        attachTrackedGuildListRefresh();
-        return () => detachTrackedGuildListRefresh();
-    }, [
-        settings.store.trackedGuildListUrl,
-        settings.store.trackedGuildListRefreshMinutes,
-    ]);
 
     return null;
 }
@@ -1780,7 +1497,6 @@ export default definePlugin({
         logDebug("stop()");
         detachObserver();
         detachHeartbeat();
-        detachTrackedGuildListRefresh();
         unmountDriver();
 
         for (const element of document.querySelectorAll<HTMLElement>("[data-vc-pl5-post-duplicate-highlighter]")) {
@@ -1792,13 +1508,9 @@ export default definePlugin({
         removeBadgeStyles();
 
         renderedRecords.clear();
+        lastRecordsSignature = "";
         postTextCache.clear();
         ruleViolationsCache.clear();
-        inviteGuildIdCache.clear();
-        inviteResolutionRetryState.clear();
-        inviteResolutionQueue.length = 0;
-        queuedOrResolvingInviteCodes.clear();
-        activeInviteResolutions = 0;
         messageFetchRetryState.clear();
         messageFetchQueue.length = 0;
         queuedOrFetchingMessageThreadIds.clear();

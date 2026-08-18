@@ -15,7 +15,6 @@ export const COLORS = {
     duplicate: 0xff6b6b,
     duplicateWarning: 0xfacc15,
     unique: 0x4ade80,
-    targetInviteGuild: 0x00e5ff,
     violation: 0x00e5ff,
     official: 0xff69b4,
 } as const;
@@ -30,20 +29,6 @@ export const LIMITS = {
         default: 3,
         min: 1,
         max: 1440,
-    },
-    trackedListRefreshMinutes: {
-        default: 15,
-        min: 1,
-        max: 1440,
-    },
-    maxConcurrentInviteResolutions: 4,
-    inviteResolutionRetry: {
-        // Exponential backoff for failed invite resolutions (expired/invalid invite,
-        // transient network error, Discord API rate limit, etc). Previously a single
-        // failure permanently marked a post as "not a target guild" for the rest of
-        // the session; this lets it keep retrying at an increasing interval instead.
-        baseMs: 10_000,
-        maxMs: 5 * 60_000,
     },
     similarityCacheMaxEntries: 4000,
     // Persisted duplicate-history log cap (survives plugin/Discord restarts). Larger
@@ -70,7 +55,6 @@ export const TIMING = {
 } as const;
 
 export const CACHE_KEYS = {
-    trackedGuildList: "vc-pl5-tracked-guild-list-v1",
     duplicateHistory: "vc-pl5-duplicate-history-v1",
 } as const;
 

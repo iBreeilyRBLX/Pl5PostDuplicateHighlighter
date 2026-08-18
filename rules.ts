@@ -244,17 +244,12 @@ function collectAiSignals(content: string): AiSignal[] {
     }
 
     // ════ STRUCTURAL TELLS - suppressed for community-artifact posts ════
-    // Decorated markdown templates (headings, dividers, emoji bullets) are
-    // normal HUMAN faction-ad culture on this forum. These only ever fire
-    // on posts with no custom emoji, no timestamps, no attachment links -
-    // i.e. bare text an LLM could have produced wholesale.
+    // Decorated markdown templates (dividers, emoji bullets) are normal HUMAN
+    // faction-ad culture on this forum. These only ever fire on posts with no
+    // custom emoji, no timestamps, no attachment links - i.e. bare text an
+    // LLM could have produced wholesale.
 
     if (!isCommunityArtifact) {
-        const markdownHeadingCount = lines.filter(line => /^#{1,3}\s+\S/.test(line)).length;
-        if (markdownHeadingCount >= 3) {
-            signals.push({ points: 1, label: `${markdownHeadingCount} markdown # headings` });
-        }
-
         const horizontalRuleCount = lines.filter(line => /^\s*(?:-{3,}|_{3,}|\*{3,}|={3,})\s*$/.test(line)).length;
         if (horizontalRuleCount >= 1) {
             signals.push({ points: 1, label: "horizontal-rule dividers (not rendered by Discord)" });
