@@ -751,21 +751,15 @@ function getDuplicateInfo(record: ThreadRecord, previousRecords: ThreadRecord[],
     let matchedReasons: MatchReason[] = [];
     let matchedContentSimilarity: number | null = null;
 
-    const markDuplicate = (previous: ThreadRecord, match: MatchEvaluation) => {
-        const expiresAt = previous.createdAt + windowMs;
-        if (duplicateUntil == null || expiresAt > duplicateUntil) {
-            duplicateUntil = expiresAt;
-            duplicateSourceThreadId = previous.threadId;
-
-            if (matchedPreviousThreadId == null) {
-                matchedPreviousThreadId = previous.threadId;
-                matchedPreviousDeltaMs = Math.max(0, record.createdAt - previous.createdAt);
-                matchedPreviousTitle = previous.title;
-                matchedReasons = [...match.reasons];
-                matchedContentSimilarity = match.contentSimilarity;
-            }
-        }
-    };
+    // activeRecords is always built as a chronological suffix of previousRecords (see
+    // buildThreadRecords: both are pushed to together, activeRecords just also shifts
+    // off its front past the cutoff), so every element in it also appears in
+    // previousRecords. A single pass - checking active-window membership as we go -
+    // covers what used to be two separate loops, each calling evaluateMatch() again
+    // for anything inside the duplicate window, doubling that work for no difference
+    // in output (matchedPrevious* always resolves to the same nearest match either
+    // way, since it's a pure function of the (record, previous) pair).
+    const activeSet = new Set(activeRecords);
 
     for (const previous of previousRecords) {
         const match = evaluateMatch(record, previous, titleEnabled, inviteEnabled, contentEnabled, similarityThreshold);
@@ -781,12 +775,13 @@ function getDuplicateInfo(record: ThreadRecord, previousRecords: ThreadRecord[],
             matchedReasons = [...match.reasons];
             matchedContentSimilarity = match.contentSimilarity;
         }
-    }
 
-    for (const previous of activeRecords) {
-        const match = evaluateMatch(record, previous, titleEnabled, inviteEnabled, contentEnabled, similarityThreshold);
-        if (match.matched) {
-            markDuplicate(previous, match);
+        if (activeSet.has(previous)) {
+            const expiresAt = previous.createdAt + windowMs;
+            if (duplicateUntil == null || expiresAt > duplicateUntil) {
+                duplicateUntil = expiresAt;
+                duplicateSourceThreadId = previous.threadId;
+            }
         }
     }
 
