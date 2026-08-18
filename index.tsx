@@ -1163,7 +1163,38 @@ function removeViolationBadge(element: HTMLElement) {
     }
 }
 
+function computeCardSignature(record: ThreadRecord) {
+    // Everything applyHighlightToCard/applyViolationBadge/applyExpiryTooltip read to
+    // decide what to write to the DOM has to be part of this, plus the threadId - the
+    // forum's virtualized list recycles DOM nodes for different posts as you scroll,
+    // so without threadId a coincidental match could skip writing a different post's
+    // data onto a reused element.
+    return [
+        record.threadId,
+        record.highlight,
+        settings.store.tintUniquePosts,
+        settings.store.showViolationBadge,
+        settings.store.showExpiryTooltip,
+        record.excludedByPattern,
+        record.violations.map(violation => `${violation.code}:${violation.summary}`).join(","),
+        record.matchedPreviousDeltaMs,
+        record.matchedReasons.join(","),
+        record.matchedContentSimilarity,
+        getDuplicateWindowMs(),
+        getWarningDuplicateThresholdMs(),
+    ].join("|");
+}
+
 function applyHighlightToCard(element: HTMLElement, record: ThreadRecord) {
+    // The forum's virtualized list keeps re-mounting/unmounting cards as you scroll,
+    // which retriggers a scan even though nothing about the underlying data changed.
+    // Skip redoing the style/badge/tooltip writes when this exact element already has
+    // this exact record's output applied - avoids needless layout/paint work and, with
+    // debug logging on, a console.log per already-correct card on every single scan.
+    const signature = computeCardSignature(record);
+    if (element.dataset.vcPl5Signature === signature) return;
+    element.dataset.vcPl5Signature = signature;
+
     if (record.highlight === "unique" && !settings.store.tintUniquePosts) {
         element.dataset.vcPl5PostDuplicateHighlighter = record.highlight;
         element.style.removeProperty("background-color");
@@ -1204,6 +1235,7 @@ function clearHighlightFromCard(element: HTMLElement) {
     if (!element.dataset.vcPl5PostDuplicateHighlighter) return;
 
     delete element.dataset.vcPl5PostDuplicateHighlighter;
+    delete element.dataset.vcPl5Signature;
     removeViolationBadge(element);
     element.style.removeProperty("background-color");
     element.style.removeProperty("border-color");
