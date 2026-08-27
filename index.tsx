@@ -1515,15 +1515,15 @@ const patchThreadContextMenu: NavContextMenuPatchCallback = (children: any, { ch
         }
     }
 
-    if (record.violations.length || record.highlight === "duplicate") {
-        children.push(
-            <Menu.MenuItem
-                id="vc-pl5-copy-violation-text"
-                label="Copy violation notice…"
-                action={() => openViolationTextModal(buildViolationNoticeContext(thread, record))}
-            />
-        );
-    }
+    // Always offered, even for posts with nothing auto-detected - the modal's
+    // guideline picker lets a mod flag any C2 rule by hand.
+    children.push(
+        <Menu.MenuItem
+            id="vc-pl5-copy-violation-text"
+            label={record.violations.length || record.highlight === "duplicate" ? "Copy violation notice…" : "Create violation notice…"}
+            action={() => openViolationTextModal(buildViolationNoticeContext(thread, record))}
+        />
+    );
 };
 
 export default definePlugin({

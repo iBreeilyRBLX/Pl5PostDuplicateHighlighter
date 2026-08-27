@@ -208,21 +208,19 @@ function DuplicateHistoryModal(props: ModalProps) {
                                             Copy link
                                         </Button>
 
-                                        {item.violations.length > 0 && (
-                                            <Button
-                                                size={Button.Sizes.SMALL}
-                                                color={Button.Colors.RED}
-                                                onClick={() => openViolationTextModal({
-                                                    threadId: item.threadId,
-                                                    threadTitle: item.threadTitle,
-                                                    authorId: item.authorId,
-                                                    authorName: item.authorName,
-                                                    violations: item.violations,
-                                                })}
-                                            >
-                                                Copy violation notice…
-                                            </Button>
-                                        )}
+                                        <Button
+                                            size={Button.Sizes.SMALL}
+                                            color={Button.Colors.RED}
+                                            onClick={() => openViolationTextModal({
+                                                threadId: item.threadId,
+                                                threadTitle: item.threadTitle,
+                                                authorId: item.authorId,
+                                                authorName: item.authorName,
+                                                violations: item.violations,
+                                            })}
+                                        >
+                                            {item.violations.length > 0 ? "Copy violation notice…" : "Create violation notice…"}
+                                        </Button>
                                     </div>
                                 </div>
                             );

@@ -366,3 +366,27 @@ export function checkRules(input: RuleCheckInput, options: RuleCheckOptions): Ru
 
     return violations;
 }
+
+export interface RuleCatalogEntry {
+    code: string;
+    label: string;
+}
+
+// Full catalog of every C2 advertising guideline, for the manual violation
+// picker in ViolationModal.tsx. This is independent of checkRules() above -
+// it also covers rules that can't be detected from post text alone and need
+// a human to judge (cooldown timing, alt accounts, plagiarism, wrong channel,
+// non-BRM5 factions, irrelevant media).
+export const C2_RULE_CATALOG: RuleCatalogEntry[] = [
+    { code: "C2-1", label: "Each advertisement post must only contain one server invite." },
+    { code: "C2-2", label: "The advertising cooldown is once every 12 hours. Each faction and group can only post once during this period." },
+    { code: "C2-3", label: "Usage of alternate accounts to bypass the 12-hour advertising cooldown is strictly prohibited." },
+    { code: "C2-4", label: "Accurate and correct tags must be used for every post. Advertisements for non-English region-locked groups are required to indicate their post with the \"Region-locked\" tag." },
+    { code: "C2-5", label: "Advertisements must be clean, well-formatted, and should not detract from previous ads. Lengthy advertisements are discouraged. Advertisements lacking content or formatting are prohibited." },
+    { code: "C2-6", label: "Advertisements with plagiarized content (formatting, images, etc.) are strictly prohibited from posting." },
+    { code: "C2-7", label: "Post titles are to avoid sensationalist language, promotional lead-ins, non-standard unicode fonts, and decorative symbols intended to artificially draw attention." },
+    { code: "C2-8", label: "Advertise in the correct channel at all times. Advertisements in other outlets, such as DMs and other channels, are prohibited." },
+    { code: "C2-9", label: "The advertising channel is reserved for BRM5 factions and communities ONLY. \"Multi-game\" groups (such as BRM5-ACS groups) are allowed so long as they operate in BRM5. Non-BRM5 factions and groups cannot advertise in the channel." },
+    { code: "C2-10", label: "Media in advertisements must be relevant to the faction and BRM5. Usage of content unrelated to the faction or game is prohibited." },
+    { code: "C2-11", label: "Content produced, generated, and enhanced by Artificial Intelligence (AI) must be disclosed in advertisements in plain text." },
+];

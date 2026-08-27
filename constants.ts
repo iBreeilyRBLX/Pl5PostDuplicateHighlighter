@@ -9,6 +9,12 @@ export const LOG_PREFIX = "[Pl5PostDuplicateHighlighter]";
 export const FIXED_IDS = {
     guildId: "553917324340625424",
     forumChannelId: "1210394762268643328",
+    // #faction-discussion - where mods track/discuss ad posts and warnings.
+    // This is where "post for {faction name}" history actually lives, not
+    // the ad forum channel itself.
+    factionDiscussionChannelId: "594055247282831360",
+    // https://discord.com/api/v9/guilds/553917324340625424/messages/search?channel_id=594055247282831360&content=post%20for%20blackout%20pmc&sort_by=timestamp&sort_order=desc&offset=0
+    // https://discord.com/api/v9/channels/594055247282831360/messages/search?content=post%20for%20BLACKOUT%20PMC&include_nsfw=true
 } as const;
 
 export const COLORS = {
