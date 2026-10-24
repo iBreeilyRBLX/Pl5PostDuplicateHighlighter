@@ -57,6 +57,41 @@ const SENSATIONAL = /\b(?:join (?:us )?now|look no further|don'?t miss(?: out)?|
 
 const EXCESSIVE_PUNCTUATION = /[!?]{3,}/;
 
+// Excessive caps. All-caps faction names are normal here ("BLACKOUT PMC", "US ARMY
+// RANGERS") and acronyms like "PMC" are everywhere, so this is deliberately
+// conservative - it needs all of:
+// - at least 6 cased letters, so short names/acronyms never count;
+// - at least 70% of those letters uppercase, so a caps name followed by a normally
+//   written tagline ("BLACKOUT PMC | Now Recruiting") passes;
+// - at least 4 all-caps words: a caps faction name is usually 1-3 words, so it takes
+//   a name plus a shouted tagline ("BLACKOUT PMC NOW RECRUITING") to trip it.
+const CAPS_MIN_LETTERS = 6;
+const CAPS_MIN_RATIO = 0.7;
+const CAPS_MIN_WORDS = 4;
+
+function isCased(char: string) {
+    return char.toLowerCase() !== char.toUpperCase();
+}
+
+function hasExcessiveCaps(rawTitle: string) {
+    // NFKC folds fullwidth/math-styled letters to plain ones so they count as cased.
+    const title = rawTitle.normalize("NFKC");
+    const letters = [...title].filter(isCased);
+    if (letters.length < CAPS_MIN_LETTERS) return false;
+
+    const upper = letters.filter(char => char === char.toUpperCase()).length;
+    if (upper / letters.length < CAPS_MIN_RATIO) return false;
+
+    const capsWords = title
+        .split(/[^\p{L}\p{N}']+/u)
+        .filter(word => {
+            const cased = [...word].filter(isCased);
+            return cased.length >= 2 && cased.every(char => char === char.toUpperCase());
+        });
+
+    return capsWords.length >= CAPS_MIN_WORDS;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // C2-11: undisclosed AI content detection
 //
@@ -320,6 +355,7 @@ function checkTitleQuality(rawTitle: string): RuleViolation | null {
     if (FANCY_LETTERS.test(rawTitle) || ZALGO.test(rawTitle)) issues.push("custom unicode letters");
     if (DECORATIVE_SYMBOLS.test(rawTitle)) issues.push("decorative symbols");
     if (SENSATIONAL.test(rawTitle)) issues.push("sensationalist language");
+    if (hasExcessiveCaps(rawTitle)) issues.push("excessive caps");
     if (EXCESSIVE_PUNCTUATION.test(rawTitle)) issues.push("excessive punctuation");
 
     if (!issues.length) return null;

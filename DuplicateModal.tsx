@@ -17,14 +17,20 @@ import {
 import { Button, ChannelRouter, ChannelStore, Forms, React, Text } from "@webpack/common";
 
 import { FIXED_IDS } from "./constants";
-import {
-    duplicateHistory,
-    formatDuration,
-    subscribeDuplicateHistory,
-} from "./index"; // or adjust if you put the exports in a shared module
+import { formatDuration } from "./format";
+import { getDuplicateHistory, subscribeDuplicateHistory } from "./history";
+import type { FdMatch } from "./records";
 import { openViolationTextModal } from "./ViolationModal";
 
-function DuplicateHistoryModal(props: ModalProps) {
+// Passed in by index.tsx: importing them from there would make index.tsx and this
+// modal import each other.
+export interface DuplicateHistoryModalOptions {
+    getDuplicateWindowMs(): number;
+    getFdMatch(threadId: string): FdMatch | null;
+}
+
+function DuplicateHistoryModal(props: ModalProps & { options: DuplicateHistoryModalOptions; }) {
+    const { options } = props;
     const [, setVersion] = React.useState(0);
 
     React.useEffect(
@@ -32,7 +38,8 @@ function DuplicateHistoryModal(props: ModalProps) {
         []
     );
 
-    const items = duplicateHistory.slice(0, 40);
+    const items = getDuplicateHistory().slice(0, 40);
+    const windowMs = options.getDuplicateWindowMs();
 
     return (
         <ModalRoot {...props} size={ModalSize.LARGE}>
@@ -68,9 +75,6 @@ function DuplicateHistoryModal(props: ModalProps) {
                             const similarityText = item.contentSimilarity == null
                                 ? ""
                                 : ` (${Math.round(item.contentSimilarity * 100)}%)`;
-
-                            const windowMs = /* you can import getDuplicateWindowMs if you export it */
-                                720 * 60 * 1000; // or better: export getDuplicateWindowMs
 
                             const timeUntilUnique = Math.max(0, windowMs - item.deltaMs);
 
@@ -217,6 +221,7 @@ function DuplicateHistoryModal(props: ModalProps) {
                                                 authorId: item.authorId,
                                                 authorName: item.authorName,
                                                 violations: item.violations,
+                                                fdMatch: options.getFdMatch(item.threadId),
                                             })}
                                         >
                                             {item.violations.length > 0 ? "Copy violation notice…" : "Create violation notice…"}
@@ -238,6 +243,6 @@ function DuplicateHistoryModal(props: ModalProps) {
     );
 }
 
-export function openDuplicateHistoryModal() {
-    openModal(props => <DuplicateHistoryModal {...props} />);
+export function openDuplicateHistoryModal(options: DuplicateHistoryModalOptions) {
+    openModal(props => <DuplicateHistoryModal {...props} options={options} />);
 }

@@ -4,16 +4,25 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+import type { FdMatch } from "./records";
 import type { RuleViolation } from "./rules";
 
 export type HighlightState = "duplicate" | "unique" | "violation";
-export type MatchReason = "title" | "invite" | "content";
+export type MatchReason = "title" | "invite" | "content" | "author";
 
 export interface ThreadRecord {
     threadId: string;
     createdAt: number;
+    // normalizeTitle() output - matched against card headings in the DOM fallback.
     title: string;
+    // normalizeFactionName() output - what duplicate title matching compares, so
+    // fancy-unicode/emoji-decorated reposts of the same title still match.
+    titleKey: string;
     inviteCode: string;
+    // Guild the invite points to: undefined while resolving (or not resolved because
+    // the post is outside the duplicate window), null if it couldn't be resolved.
+    inviteGuildId: string | null | undefined;
+    authorId: string;
     contentSnippet: string;
     highlight: HighlightState;
     duplicateUntil: number | null;
@@ -25,6 +34,7 @@ export interface ThreadRecord {
     matchedContentSimilarity: number | null;
     excludedByPattern: boolean;
     violations: RuleViolation[];
+    fdMatch: FdMatch | null;
 }
 
 export interface MatchEvaluation {
@@ -68,4 +78,5 @@ export interface ViolationNoticeContext {
     authorId: string;
     authorName: string;
     violations: RuleViolation[];
+    fdMatch: FdMatch | null;
 }

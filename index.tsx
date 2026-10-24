@@ -6,14 +6,19 @@
 
 import { ApplicationCommandInputType } from "@api/Commands";
 import { NavContextMenuPatchCallback } from "@api/ContextMenu";
-import { definePluginSettings } from "@api/Settings";
+import { definePluginSettings, SettingsStore } from "@api/Settings";
 import definePlugin, { OptionType } from "@utils/types";
-import { Button, ChannelRouter, ChannelStore, createRoot, Menu, MessageActions, MessageStore, React, SelectedChannelStore, useStateFromStores } from "@webpack/common";
-import type { Root } from "react-dom/client";
+import type { Message } from "@vencord/discord-types";
+import { Button, ChannelRouter, ChannelStore, Constants, Menu, MessageStore, RestAPI, SelectedChannelStore } from "@webpack/common";
 
-import { BADGE_STYLE_ID, CACHE_KEYS, COLORS, FIXED_IDS, LIMITS, LOG_PREFIX, PATTERNS, TIMING } from "./constants";
+import { BADGE_STYLE_ID, COLORS, FIXED_IDS, LIMITS, LOG_PREFIX, PATTERNS, TIMING } from "./constants";
 import { openDuplicateHistoryModal } from "./DuplicateModal";
+import { formatCooldownWindowLabel, formatDuration, formatDurationWords, formatMatchReasons } from "./format";
+import { updateDuplicateHistory } from "./history";
+import { clearRecordsCache, describeFdLevel, type FdMatch, formatFdBadge, formatFdRecordLine, getFdMatch, getRecordsVersion, resolveInviteGuildId, setRecordsChangeListener, stopRecords } from "./records";
 import { checkRules, type RuleCheckOptions, type RuleViolation } from "./rules";
+import { levenshteinSimilarity } from "./similarity";
+import { normalizeContent, normalizeFactionName, normalizeTitle } from "./text";
 import type { DuplicateHistoryEntry, ForumCardMatch, MatchEvaluation, MatchReason, RecordSummary, ThreadRecord, ViolationNoticeContext } from "./types";
 import { openViolationTextModal } from "./ViolationModal";
 
@@ -113,17 +118,22 @@ const settings = definePluginSettings({
     checkTitle: {
         type: OptionType.BOOLEAN,
         default: true,
-        description: "Compare normalized post titles",
+        description: "Compare normalized post titles (ignores case, fancy unicode letters, emoji, and symbols)",
     },
     checkInvite: {
         type: OptionType.BOOLEAN,
         default: true,
-        description: "Compare Discord invite codes found in the first message",
+        description: "Compare Discord invites found in the first message (same code, or different codes for the same server)",
     },
     checkContent: {
         type: OptionType.BOOLEAN,
         default: true,
-        description: "Compare the first 80 characters of the first message content",
+        description: `Compare the first ${LIMITS.contentSnippetLength} characters of the first message content (ignoring emoji, links, timestamps, and markdown)`,
+    },
+    checkAuthor: {
+        type: OptionType.BOOLEAN,
+        default: true,
+        description: "Treat a post by the same author within the duplicate window as a duplicate",
     },
     similarityThreshold: {
         type: OptionType.SLIDER,
@@ -137,11 +147,40 @@ const settings = definePluginSettings({
         default: true,
         description: "Show remaining duplicate window time when hovering duplicate cards",
     },
+    fdRecordsEnabled: {
+        type: OptionType.BOOLEAN,
+        default: true,
+        description: "Check posts against the FD blacklist/warning records (pl5fd.com)",
+    },
+    fdCheckAuthor: {
+        type: OptionType.BOOLEAN,
+        default: true,
+        description: "FD: look up the post author's Discord ID (also matches server owners)",
+    },
+    fdCheckTitle: {
+        type: OptionType.BOOLEAN,
+        default: true,
+        description: "FD: look up the post title as a faction name (shown as a possible match)",
+    },
+    fdConfirmViaInvite: {
+        type: OptionType.BOOLEAN,
+        default: true,
+        description: "FD: when something matches, resolve the post's invite and confirm by server ID",
+    },
+    fdClearCache: {
+        type: OptionType.COMPONENT,
+        description: "Clear cached FD records",
+        component: () => (
+            <Button size={Button.Sizes.SMALL} onClick={clearRecordsCache}>
+                Clear FD records cache
+            </Button>
+        ),
+    },
     duplicateHistoryPanel: {
         type: OptionType.COMPONENT,
         description: "Recent duplicate matches",
         component: () => (
-            <Button size={Button.Sizes.SMALL} onClick={openDuplicateHistoryModal}>
+            <Button size={Button.Sizes.SMALL} onClick={openHistoryModal}>
                 Open duplicate history
             </Button>
         ),
@@ -153,8 +192,6 @@ const settings = definePluginSettings({
     },
 });
 
-let mountNode: HTMLDivElement | null = null;
-let reactRoot: Root | null = null;
 let mutationObserver: MutationObserver | null = null;
 let scanQueued = false;
 let refreshTimer: number | null = null;
@@ -167,9 +204,6 @@ let renderedRecords = new Map<string, ThreadRecord>();
 // cards while scrolling) re-triggers the observer and pays for a full rebuild even
 // though renderedRecords would come out identical.
 let lastRecordsSignature = "";
-export let duplicateHistory: DuplicateHistoryEntry[] = readDuplicateHistoryCache();
-let duplicateHistorySignature = computeDuplicateHistorySignature(duplicateHistory);
-const duplicateHistoryListeners = new Set<() => void>();
 const postTextCache = new Map<string, { firstMessageId: string; content: string; inviteCode: string; }>();
 // checkRules() runs a dozen-plus regexes (title quality, invite counting, and
 // especially the C2-11 AI-signal detector) over full post content. Without this
@@ -180,6 +214,10 @@ const postTextCache = new Map<string, { firstMessageId: string; content: string;
 const ruleViolationsCache = new Map<string, { firstMessageId: string; rawTitle: string; appliedTagsKey: string; optionsKey: string; violations: RuleViolation[]; }>();
 // Backoff bookkeeping for threads whose first message failed to fetch at least once.
 const messageFetchRetryState = new Map<string, { failCount: number; nextRetryAt: number; }>();
+// Opening messages fetched by fetchFirstMessage(). The REST response isn't merged
+// into MessageStore (that's Discord's own job when the thread is opened), so it's
+// kept here; null means the opening message was deleted and shouldn't be refetched.
+const fetchedFirstMessages = new Map<string, Message | null>();
 // Bounded-concurrency queue for proactively fetching a forum thread's first message
 // when it isn't already cached client-side (e.g. right after a restart, or for a post
 // the officer hasn't opened yet) - without this, duplicate/violation checks that need
@@ -208,116 +246,14 @@ function logDebugGroup(title: string, entries: Array<() => void>) {
     }
 }
 
-function isDuplicateHistoryEntry(value: unknown): value is DuplicateHistoryEntry {
-    if (!value || typeof value !== "object") return false;
-
-    const entry = value as Partial<DuplicateHistoryEntry>;
-    return typeof entry.threadId === "string"
-        && typeof entry.sourceThreadId === "string"
-        && typeof entry.createdAt === "number"
-        && Array.isArray(entry.reasons)
-        && Array.isArray(entry.violations);
+function getRenderedFdMatch(threadId: string) {
+    return renderedRecords.get(threadId)?.fdMatch ?? null;
 }
 
-function readDuplicateHistoryCache(): DuplicateHistoryEntry[] {
-    try {
-        const raw = localStorage.getItem(CACHE_KEYS.duplicateHistory);
-        if (!raw) return [];
-
-        const parsed = JSON.parse(raw);
-        if (!Array.isArray(parsed)) return [];
-
-        return parsed.filter(isDuplicateHistoryEntry).slice(0, LIMITS.duplicateHistoryMaxEntries);
-    } catch {
-        return [];
-    }
-}
-
-function writeDuplicateHistoryCache(history: DuplicateHistoryEntry[]) {
-    try {
-        localStorage.setItem(CACHE_KEYS.duplicateHistory, JSON.stringify(history));
-    } catch {
-        // Ignore storage failures (quota exceeded, private browsing, etc).
-    }
-}
-
-function computeDuplicateHistorySignature(history: DuplicateHistoryEntry[]) {
-    return history.map(entry => `${entry.threadId}:${entry.sourceThreadId}:${entry.createdAt}`).join("|");
-}
-
-function mergeDuplicateHistoryEntry(previous: DuplicateHistoryEntry, incoming: DuplicateHistoryEntry): DuplicateHistoryEntry {
-    // Prefer the freshly-computed entry, but a scan that ran before this thread's first
-    // message was cached (author "Unknown", empty snippet/invite) shouldn't clobber
-    // better data an earlier scan already recorded for the same thread.
-    return {
-        ...incoming,
-        authorName: incoming.authorName && incoming.authorName !== "Unknown" ? incoming.authorName : previous.authorName,
-        authorId: incoming.authorId || previous.authorId,
-        contentSnippet: incoming.contentSnippet || previous.contentSnippet,
-        inviteCode: incoming.inviteCode || previous.inviteCode,
-    };
-}
-
-function mergeDuplicateHistory(existing: DuplicateHistoryEntry[], incoming: DuplicateHistoryEntry[]) {
-    const merged = new Map<string, DuplicateHistoryEntry>();
-
-    // Persisted entries first, then let a freshly-computed entry for the same thread
-    // overwrite it with up-to-date data. This is what makes the log survive a plugin
-    // or Discord restart instead of resetting to only whatever's currently loaded in
-    // the client's thread/message caches.
-    for (const entry of existing) merged.set(entry.threadId, entry);
-    for (const entry of incoming) {
-        const previous = merged.get(entry.threadId);
-        merged.set(entry.threadId, previous ? mergeDuplicateHistoryEntry(previous, entry) : entry);
-    }
-
-    return [...merged.values()]
-        .sort((left, right) => right.createdAt - left.createdAt)
-        .slice(0, LIMITS.duplicateHistoryMaxEntries);
-}
-
-export function subscribeDuplicateHistory(listener: () => void) {
-    duplicateHistoryListeners.add(listener);
-    return () => {
-        duplicateHistoryListeners.delete(listener);
-    };
-}
-
-function emitDuplicateHistory() {
-    for (const listener of duplicateHistoryListeners) {
-        try {
-            listener();
-        } catch {
-            // Ignore listener failures.
-        }
-    }
-}
-
-function DuplicateHistoryPanel() {
-    const [, setVersion] = React.useState(0);
-
-    React.useEffect(() => subscribeDuplicateHistory(() => setVersion((v: number) => v + 1)), []);
-
-    const items = duplicateHistory.slice(0, 30);
-    if (!items.length) {
-        return <div style={{ opacity: 0.8 }}>No duplicate history yet.</div>;
-    }
-
-    return (
-        <div style={{ display: "grid", gap: 6, maxHeight: 260, overflowY: "auto", paddingRight: 4 }}>
-            {items.map(item => {
-                const reasonText = item.reasons.map(reason => reason.toUpperCase()).join(", ") || "NONE";
-                const similarityText = item.contentSimilarity == null ? "" : ` (${Math.round(item.contentSimilarity * 100)}%)`;
-                return (
-                    <div key={`${item.threadId}:${item.sourceThreadId}`} style={{ fontSize: 12, lineHeight: 1.3, opacity: 0.95 }}>
-                        <strong>{item.threadTitle || item.threadId}</strong>
-                        <div>matches {item.sourceTitle || item.sourceThreadId}</div>
-                        <div>{formatDuration(item.deltaMs)} apart | {reasonText}{similarityText}</div>
-                    </div>
-                );
-            })}
-        </div>
-    );
+// DuplicateModal gets the window and FD lookups passed in rather than importing
+// them from here, which would make it (and the settings button below) circular.
+function openHistoryModal() {
+    openDuplicateHistoryModal({ getDuplicateWindowMs, getFdMatch: getRenderedFdMatch });
 }
 
 function getExcludeRegex() {
@@ -342,12 +278,6 @@ function getExcludeRegex() {
     return excludeRegexCache;
 }
 
-function formatMatchReasons(reasons: MatchReason[], contentSimilarity: number | null) {
-    if (!reasons.length) return "none";
-
-    return reasons.join(", ");
-}
-
 function getSimilarityThreshold() {
     const threshold = Number(settings.store.similarityThreshold) || FALLBACKS.similarityThreshold;
     return Math.min(100, Math.max(0, threshold)) / 100;
@@ -362,14 +292,6 @@ function getDuplicateWindowMs() {
     return safeMinutes * 60 * 1000;
 }
 
-function normalizeTitle(title: string) {
-    return title.trim().toLowerCase().replace(/\s+/g, " ");
-}
-
-function normalizeContent(content: string) {
-    return content.trim().toLowerCase().replace(/\s+/g, " ").slice(0, 80);
-}
-
 function extractInviteCode(content: string) {
     const inviteMatch = content.match(PATTERNS.discordInvite);
     return inviteMatch?.[1].toLowerCase() ?? "";
@@ -381,7 +303,7 @@ function getRuleCheckOptions(): RuleCheckOptions {
         tagCheck: settings.store.ruleMissingTags,
         titleQuality: settings.store.ruleTitleQuality,
         aiDisclosure: settings.store.ruleUndisclosedAi,
-        aiSignalThreshold: Number(settings.store.aiSignalThreshold) || 3,
+        aiSignalThreshold: Number(settings.store.aiSignalThreshold) || 4,
     };
 }
 
@@ -451,10 +373,23 @@ function pumpMessageFetchQueue() {
 async function fetchFirstMessage(threadId: string) {
     activeMessageFetches++;
     try {
-        // Forum threads are typically short, so the latest `limit` messages almost
-        // always include the opening post; this mirrors the fetchMessages usage
-        // elsewhere in Vencord rather than reaching for a lower-level API.
-        await MessageActions.fetchMessages({ channelId: threadId, limit: 50 });
+        // A forum post's opening message shares the thread's id, so this one-message
+        // `around` fetch is the smallest request that returns it - the same pattern
+        // messageLinkEmbeds/validReply use. (MessageActions.fetchMessages has no
+        // typed single-message form and would pull a whole page of replies.)
+        const res = await RestAPI.get({
+            url: Constants.Endpoints.MESSAGES(threadId),
+            query: { limit: 1, around: threadId },
+        });
+        const message = res?.body?.[0];
+        // `around` returns the nearest surviving message when the opening post was
+        // deleted - that's a reply, so it must not stand in for the post.
+        fetchedFirstMessages.set(
+            threadId,
+            message?.id === threadId
+                ? MessageStore.getMessages(threadId).receiveMessage(message).get(threadId) ?? null
+                : null,
+        );
         messageFetchRetryState.delete(threadId);
     } catch (error) {
         const previousFailCount = messageFetchRetryState.get(threadId)?.failCount ?? 0;
@@ -501,32 +436,17 @@ function getThreadCreatedAt(channel: ReturnType<typeof ChannelStore.getChannel>)
     return snowflakeToTimestamp(channel.id);
 }
 
-function getFirstForumMessage(channelId: string) {
-    const channel = ChannelStore.getChannel(channelId);
-    const messages = MessageStore.getMessages(channelId)?._array ?? [];
+// A forum post's opening message has the same id as the thread. No "oldest loaded
+// message" fallback: with only part of the thread loaded that's a reply, which would
+// attribute someone else's author/content to the post.
+function getFirstForumMessage(threadId: string): Message | undefined {
+    return MessageStore.getMessage(threadId, threadId) ?? fetchedFirstMessages.get(threadId) ?? undefined;
+}
 
-    for (const message of messages) {
-        if ((message as any).isFirstMessageInForumPost?.(channel)) return message;
-    }
-
-    let oldest = messages[0];
-    for (let i = 1; i < messages.length; i++) {
-        const current = messages[i];
-        if (!oldest) {
-            oldest = current;
-            continue;
-        }
-
-        try {
-            if (BigInt(current.id) < BigInt(oldest.id)) {
-                oldest = current;
-            }
-        } catch {
-            continue;
-        }
-    }
-
-    return oldest;
+// Cache key for the opening message's current version, so edits invalidate the
+// text/rule caches below instead of being masked by an unchanged message id.
+function getFirstMessageKey(message: Message | undefined) {
+    return message ? `${message.id}:${message.editedTimestamp ?? ""}` : "";
 }
 
 function hexToRgba(hexColor: number, alpha: number) {
@@ -634,13 +554,15 @@ function getPostText(channelId: string) {
     if (!message) {
         // Message not cached client-side yet (e.g. right after a restart). Queue a
         // fetch so content/invite/author data backfills on a later scan instead of
-        // staying empty until someone happens to open the thread.
-        scheduleFirstMessageFetch(channelId);
+        // staying empty until someone happens to open the thread. Skipped once a
+        // fetch has shown the opening message was deleted.
+        if (!fetchedFirstMessages.has(channelId)) scheduleFirstMessageFetch(channelId);
         return { content: "", inviteCode: "" };
     }
 
+    const firstMessageKey = getFirstMessageKey(message);
     const cached = postTextCache.get(channelId);
-    if (cached && cached.firstMessageId === message.id) {
+    if (cached && cached.firstMessageId === firstMessageKey) {
         return {
             content: cached.content,
             inviteCode: cached.inviteCode,
@@ -651,7 +573,7 @@ function getPostText(channelId: string) {
     const inviteCode = extractInviteCode(content);
 
     postTextCache.set(channelId, {
-        firstMessageId: message.id,
+        firstMessageId: firstMessageKey,
         content,
         inviteCode,
     });
@@ -662,52 +584,33 @@ function getPostText(channelId: string) {
     };
 }
 
-function levenshteinSimilarity(a: string, b: string) {
-    if (a === b) return 1;
-    if (!a.length || !b.length) return 0;
-
-    const previous = new Array(b.length + 1);
-    const current = new Array(b.length + 1);
-
-    for (let j = 0; j <= b.length; j++) previous[j] = j;
-
-    for (let i = 1; i <= a.length; i++) {
-        current[0] = i;
-        const aChar = a.charCodeAt(i - 1);
-
-        for (let j = 1; j <= b.length; j++) {
-            const cost = aChar === b.charCodeAt(j - 1) ? 0 : 1;
-            current[j] = Math.min(
-                previous[j] + 1,
-                current[j - 1] + 1,
-                previous[j - 1] + cost,
-            );
-        }
-
-        for (let j = 0; j <= b.length; j++) previous[j] = current[j];
-    }
-
-    const distance = previous[b.length];
-    return 1 - (distance / Math.max(a.length, b.length));
+interface MatchOptions {
+    titleEnabled: boolean;
+    inviteEnabled: boolean;
+    contentEnabled: boolean;
+    authorEnabled: boolean;
+    similarityThreshold: number;
 }
 
-function evaluateMatch(
-    left: ThreadRecord,
-    right: ThreadRecord,
-    titleEnabled: boolean,
-    inviteEnabled: boolean,
-    contentEnabled: boolean,
-    similarityThreshold: number,
-): MatchEvaluation {
+function evaluateMatch(left: ThreadRecord, right: ThreadRecord, options: MatchOptions): MatchEvaluation {
+    const { titleEnabled, inviteEnabled, contentEnabled, authorEnabled, similarityThreshold } = options;
     const reasons: MatchReason[] = [];
     let contentSimilarity: number | null = null;
 
-    if (titleEnabled && left.title && right.title && left.title === right.title) {
+    if (titleEnabled && left.titleKey && right.titleKey && left.titleKey === right.titleKey) {
         reasons.push("title");
     }
 
-    if (inviteEnabled && left.inviteCode && right.inviteCode && left.inviteCode === right.inviteCode) {
-        reasons.push("invite");
+    if (inviteEnabled && left.inviteCode && right.inviteCode) {
+        // Different invite codes can point at the same server; once both have resolved
+        // (undefined = pending, null = unresolvable) compare the server instead.
+        const sameCode = left.inviteCode === right.inviteCode;
+        const sameGuild = left.inviteGuildId != null && left.inviteGuildId === right.inviteGuildId;
+        if (sameCode || sameGuild) reasons.push("invite");
+    }
+
+    if (authorEnabled && left.authorId && left.authorId === right.authorId) {
+        reasons.push("author");
     }
 
     if (contentEnabled && left.contentSnippet && right.contentSnippet) {
@@ -718,8 +621,14 @@ function evaluateMatch(
             let similarity = similarityCache.get(similarityCacheKey);
             if (similarity == null) {
                 similarity = levenshteinSimilarity(left.contentSnippet, right.contentSnippet);
-                if (similarityCache.size > LIMITS.similarityCacheMaxEntries) {
-                    similarityCache.clear();
+                if (similarityCache.size >= LIMITS.similarityCacheMaxEntries) {
+                    // Drop the oldest half (Map iteration is insertion order) rather
+                    // than everything, so the next scan doesn't recompute every pair.
+                    let toEvict = Math.floor(similarityCache.size / 2);
+                    for (const key of similarityCache.keys()) {
+                        if (toEvict-- <= 0) break;
+                        similarityCache.delete(key);
+                    }
                 }
                 similarityCache.set(similarityCacheKey, similarity);
             }
@@ -739,10 +648,13 @@ function evaluateMatch(
 }
 
 function getDuplicateInfo(record: ThreadRecord, previousRecords: ThreadRecord[], activeRecords: ThreadRecord[], windowMs: number) {
-    const titleEnabled = settings.store.checkTitle;
-    const inviteEnabled = settings.store.checkInvite;
-    const contentEnabled = settings.store.checkContent;
-    const similarityThreshold = getSimilarityThreshold();
+    const matchOptions: MatchOptions = {
+        titleEnabled: settings.store.checkTitle,
+        inviteEnabled: settings.store.checkInvite,
+        contentEnabled: settings.store.checkContent,
+        authorEnabled: settings.store.checkAuthor,
+        similarityThreshold: getSimilarityThreshold(),
+    };
     let duplicateUntil: number | null = null;
     let duplicateSourceThreadId: string | null = null;
     let matchedPreviousThreadId: string | null = null;
@@ -760,9 +672,16 @@ function getDuplicateInfo(record: ThreadRecord, previousRecords: ThreadRecord[],
     // in output (matchedPrevious* always resolves to the same nearest match either
     // way, since it's a pure function of the (record, previous) pair).
     const activeSet = new Set(activeRecords);
+    // previousRecords is chronological, so walk it newest-first and stop once posts are
+    // too old to matter: the active window is always inside this lookback, so only the
+    // tooltip's "nearest previous match" for long-unique posts is affected.
+    const lookbackCutoff = record.createdAt - windowMs * LIMITS.duplicateLookbackWindows;
 
-    for (const previous of previousRecords) {
-        const match = evaluateMatch(record, previous, titleEnabled, inviteEnabled, contentEnabled, similarityThreshold);
+    for (let i = previousRecords.length - 1; i >= 0; i--) {
+        const previous = previousRecords[i];
+        if (previous.createdAt < lookbackCutoff) break;
+
+        const match = evaluateMatch(record, previous, matchOptions);
         if (!match.matched) {
             continue;
         }
@@ -797,47 +716,16 @@ function getDuplicateInfo(record: ThreadRecord, previousRecords: ThreadRecord[],
     };
 }
 
-export function formatDuration(ms: number) {
-    const safe = Math.max(0, ms);
-    if (safe <= 0) return "0m";
-
-    const totalMinutes = Math.ceil(safe / 60000);
-    const hours = Math.floor(totalMinutes / 60);
-    const minutes = totalMinutes % 60;
-
-    if (hours > 0 && minutes > 0) return `${hours}h ${minutes}m`;
-    if (hours > 0) return `${hours}h`;
-    return `${totalMinutes}m`;
-}
-
-// Prose duration for violation-notice text, e.g. "1 hour and 24 minutes" /
-// "45 minutes", matching the wording used in the C2 warning templates.
-function formatDurationWords(ms: number) {
-    const totalMinutes = Math.max(0, Math.round(ms / 60000));
-    const hours = Math.floor(totalMinutes / 60);
-    const minutes = totalMinutes % 60;
-
-    const hourPart = hours > 0 ? `${hours} hour${hours === 1 ? "" : "s"}` : "";
-    const minutePart = minutes > 0 ? `${minutes} minute${minutes === 1 ? "" : "s"}` : "";
-
-    if (hourPart && minutePart) return `${hourPart} and ${minutePart}`;
-    return hourPart || minutePart || "0 minutes";
-}
-
-function formatCooldownWindowLabel(ms: number) {
-    const totalMinutes = Math.max(0, Math.round(ms / 60000));
-    if (totalMinutes > 0 && totalMinutes % 60 === 0) {
-        return `${totalMinutes / 60}-hour cooldown`;
-    }
-
-    return `${formatDurationWords(ms)} cooldown`;
+// Duplicate-ness is read from the match itself rather than record.highlight.
+function isDuplicateRecord(record: ThreadRecord) {
+    return record.duplicateUntil != null;
 }
 
 // C2-2: re-posting before the duplicate window (cooldown) has elapsed. This isn't
 // one of the rules.ts content checks - it's derived from the duplicate match itself -
 // so it's synthesized here rather than returned from checkRules().
 function buildCooldownViolation(record: ThreadRecord): RuleViolation | null {
-    if (record.highlight !== "duplicate" || record.matchedPreviousDeltaMs == null) return null;
+    if (!isDuplicateRecord(record) || record.matchedPreviousDeltaMs == null) return null;
 
     const windowMs = getDuplicateWindowMs();
     const earlyByMs = Math.max(0, windowMs - record.matchedPreviousDeltaMs);
@@ -870,6 +758,10 @@ function applyExpiryTooltip(element: HTMLElement, record: ThreadRecord) {
     const tooltipLines: string[] = [];
     const windowMs = getDuplicateWindowMs();
 
+    if (record.fdMatch) {
+        tooltipLines.push(`FD ${record.fdMatch.hasActive ? record.fdMatch.kind : "history only"} (${describeFdLevel(record.fdMatch)}): ${record.fdMatch.records.map(formatFdRecordLine).join("; ")}`);
+    }
+
     if (record.excludedByPattern) {
         tooltipLines.push("Excluded by regex pattern");
     }
@@ -895,6 +787,24 @@ function applyExpiryTooltip(element: HTMLElement, record: ThreadRecord) {
     element.setAttribute("title", tooltipLines.join(" | "));
 }
 
+function getForumThreads(): any[] {
+    return ChannelStore.getAllThreadsForParent(FIXED_IDS.forumChannelId)
+        .filter((channel: any) => channel?.isForumPost?.() && channel.getGuildId() === FIXED_IDS.guildId);
+}
+
+// Per-thread inputs to buildThreadRecords(): thread metadata, tags, and which version
+// of the opening message (if any) is available yet.
+function computeThreadSignature(thread: any) {
+    return [
+        thread.id,
+        thread.name ?? "",
+        thread.lastMessageId ?? "",
+        thread.messageCount ?? 0,
+        getFirstMessageKey(getFirstForumMessage(thread.id)),
+        (thread.appliedTags ?? []).join(","),
+    ].join(":");
+}
+
 function computeRecordsSignature(threads: any[]) {
     // Everything here that can change what buildThreadRecords() produces has to be
     // part of the signature, or a settings/content change could get silently skipped
@@ -906,25 +816,43 @@ function computeRecordsSignature(threads: any[]) {
         settings.store.checkTitle,
         settings.store.checkInvite,
         settings.store.checkContent,
+        settings.store.checkAuthor,
         settings.store.similarityThreshold,
         settings.store.ruleMultipleInvites,
         settings.store.ruleMissingTags,
         settings.store.ruleTitleQuality,
         settings.store.ruleUndisclosedAi,
         settings.store.aiSignalThreshold,
+        settings.store.fdRecordsEnabled,
+        settings.store.fdCheckAuthor,
+        settings.store.fdCheckTitle,
+        settings.store.fdConfirmViaInvite,
+        getRecordsVersion(),
     ].join("|");
 
-    const threadsKey = threads
-        .map((thread: any) => `${thread.id}:${thread.lastMessageId ?? ""}:${thread.messageCount ?? 0}:${MessageStore.getMessages(thread.id)?._array.length ?? 0}:${((thread as any).appliedTags ?? []).join(",")}`)
-        .join("|");
+    const threadsKey = threads.map(computeThreadSignature).join("|");
 
     return `${settingsKey}::${threadsKey}`;
 }
 
+function getFdMatchForThread(thread: any, inviteCode: string): FdMatch | null {
+    if (!settings.store.fdRecordsEnabled) return null;
+
+    return getFdMatch(
+        getFirstForumMessage(thread.id)?.author?.id ?? "",
+        thread.name ?? "",
+        inviteCode,
+        {
+            checkAuthor: settings.store.fdCheckAuthor,
+            checkTitle: settings.store.fdCheckTitle,
+            confirmViaInvite: settings.store.fdConfirmViaInvite,
+        },
+    );
+}
+
 function buildThreadRecords() {
     const windowMs = getDuplicateWindowMs();
-    const threads = ChannelStore.getAllThreadsForParent(FIXED_IDS.forumChannelId)
-        .filter((channel: any) => channel?.isForumPost?.() && channel.getGuildId() === FIXED_IDS.guildId)
+    const threads = getForumThreads()
         .sort((left: any, right: any) => getThreadCreatedAt(left) - getThreadCreatedAt(right));
 
     const signature = computeRecordsSignature(threads);
@@ -936,6 +864,9 @@ function buildThreadRecords() {
     }
     lastRecordsSignature = signature;
 
+    // Only posts inside the duplicate window get their invites resolved for
+    // same-server matching - older ones can't make a current post a duplicate.
+    const inviteResolveCutoff = Date.now() - windowMs;
     const activeRecords: ThreadRecord[] = [];
     const previousRecords: ThreadRecord[] = [];
     const nextRecords = new Map<string, ThreadRecord>();
@@ -948,11 +879,15 @@ function buildThreadRecords() {
             activeRecords.shift();
         }
 
+        const firstMessage = getFirstForumMessage(thread.id);
         const record: ThreadRecord = {
             threadId: thread.id,
             createdAt,
             title: normalizeTitle(thread.name ?? ""),
+            titleKey: normalizeFactionName(thread.name ?? ""),
             inviteCode: "",
+            inviteGuildId: undefined,
+            authorId: firstMessage?.author?.id ?? "",
             contentSnippet: "",
             highlight: "unique",
             duplicateUntil: null,
@@ -964,11 +899,16 @@ function buildThreadRecords() {
             matchedContentSimilarity: null,
             excludedByPattern: false,
             violations: [],
+            fdMatch: null,
         };
 
         const { content, inviteCode } = getPostText(thread.id);
         record.inviteCode = inviteCode;
+        if (inviteCode && settings.store.checkInvite && createdAt >= inviteResolveCutoff) {
+            record.inviteGuildId = resolveInviteGuildId(inviteCode);
+        }
         record.contentSnippet = normalizeContent(content);
+        record.fdMatch = getFdMatchForThread(thread, inviteCode);
 
         const appliedTags = Array.isArray((thread as any).appliedTags)
             ? (thread as any).appliedTags.map(String)
@@ -992,7 +932,8 @@ function buildThreadRecords() {
 
         const duplicateInfo = getDuplicateInfo(record, previousRecords, activeRecords, windowMs);
         // Tint priority: duplicate > violation > unique.
-        // Violations on duplicate posts still surface via badge + tooltip.
+        // Violations on duplicate posts still surface via badge + tooltip, and FD
+        // records are an extra outline + badge on top of whatever tint applies.
         record.highlight = duplicateInfo.isDuplicate
             ? "duplicate"
             : record.violations.length
@@ -1014,8 +955,8 @@ function buildThreadRecords() {
 
     renderedRecords = nextRecords;
 
-    const liveHistory = [...nextRecords.values()]
-        .filter(record => record.highlight === "duplicate" && record.matchedPreviousThreadId && record.matchedPreviousDeltaMs != null)
+    const liveHistory: DuplicateHistoryEntry[] = [...nextRecords.values()]
+        .filter(record => isDuplicateRecord(record) && record.matchedPreviousThreadId && record.matchedPreviousDeltaMs != null)
         .sort((left, right) => right.createdAt - left.createdAt)
         .map(record => {
             const source = nextRecords.get(record.matchedPreviousThreadId!) ?? null;
@@ -1042,20 +983,10 @@ function buildThreadRecords() {
                 inviteCode: record.inviteCode,
                 violations,
                 excludedByPattern: record.excludedByPattern,
-            } as DuplicateHistoryEntry;
+            };
         });
 
-    // Merge into (rather than replace) the persisted log, so entries survive a plugin
-    // or Discord restart even before the client has reloaded every thread/message that
-    // originally fed a match.
-    const history = mergeDuplicateHistory(duplicateHistory, liveHistory);
-    const historySignature = computeDuplicateHistorySignature(history);
-    if (historySignature !== duplicateHistorySignature) {
-        duplicateHistorySignature = historySignature;
-        duplicateHistory = history;
-        writeDuplicateHistoryCache(history);
-        emitDuplicateHistory();
-    }
+    updateDuplicateHistory(liveHistory);
 
     logDebugGroup("buildThreadRecords", [
         () => logDebug("windowMs", windowMs),
@@ -1149,17 +1080,34 @@ function getForumCardMatches(): ForumCardMatch[] {
     return result;
 }
 
+// FD records never replace the tint - they add an inset outline on top of it, so the
+// duplicate/violation/unique state stays visible. Name-only matches get a dashed-looking
+// thinner outline since they're only "possible".
+function applyFdOutline(element: HTMLElement, fdMatch: FdMatch | null) {
+    if (!fdMatch) {
+        element.style.removeProperty("box-shadow");
+        return;
+    }
+
+    const color = !fdMatch.hasActive
+        ? COLORS.fdPast
+        : fdMatch.kind === "blacklist" ? COLORS.fdBlacklist : COLORS.fdWarning;
+    const width = fdMatch.level === "name" ? 1 : 2;
+    setCardStyle(element, "box-shadow", `inset 0 0 0 ${width}px ${hexToRgba(color, fdMatch.notInDb ? 0.45 : 0.9)}`);
+}
+
 function setCardStyle(element: HTMLElement, property: string, value: string) {
     element.style.setProperty(property, value, "important");
 }
 
 function applyViolationBadge(element: HTMLElement, record: ThreadRecord) {
-    if (!settings.store.showViolationBadge || !record.violations.length) {
+    const showViolations = settings.store.showViolationBadge && record.violations.length > 0;
+    if (!showViolations && !record.fdMatch) {
         removeViolationBadge(element);
         return;
     }
 
-    // The ::after badge is absolutely positioned, so the card needs to be a
+    // The ::before/::after badges are absolutely positioned, so the card needs to be a
     // positioning context. Only patch cards that are position: static so we
     // never break Discord's own absolutely-positioned list items.
     if (element.dataset.vcPl5PositionPatched !== "1" && getComputedStyle(element).position === "static") {
@@ -1167,11 +1115,28 @@ function applyViolationBadge(element: HTMLElement, record: ThreadRecord) {
         element.style.setProperty("position", "relative");
     }
 
-    element.setAttribute("data-vc-pl5-violations", record.violations.map(violation => violation.code).join(" "));
+    if (showViolations) {
+        element.setAttribute("data-vc-pl5-violations", record.violations.map(violation => violation.code).join(" "));
+    } else {
+        element.removeAttribute("data-vc-pl5-violations");
+    }
+
+    if (record.fdMatch) {
+        element.setAttribute("data-vc-pl5-fd", formatFdBadge(record.fdMatch));
+        element.setAttribute("data-vc-pl5-fd-kind", record.fdMatch.hasActive ? record.fdMatch.kind : "past");
+        element.toggleAttribute("data-vc-pl5-fd-dim", record.fdMatch.notInDb);
+    } else {
+        element.removeAttribute("data-vc-pl5-fd");
+        element.removeAttribute("data-vc-pl5-fd-kind");
+        element.removeAttribute("data-vc-pl5-fd-dim");
+    }
 }
 
 function removeViolationBadge(element: HTMLElement) {
     element.removeAttribute("data-vc-pl5-violations");
+    element.removeAttribute("data-vc-pl5-fd");
+    element.removeAttribute("data-vc-pl5-fd-kind");
+    element.removeAttribute("data-vc-pl5-fd-dim");
     if (element.dataset.vcPl5PositionPatched === "1") {
         delete element.dataset.vcPl5PositionPatched;
         element.style.removeProperty("position");
@@ -1190,8 +1155,10 @@ function computeCardSignature(record: ThreadRecord) {
         settings.store.tintUniquePosts,
         settings.store.showViolationBadge,
         settings.store.showExpiryTooltip,
+        settings.store.checkAuthor,
         record.excludedByPattern,
         record.violations.map(violation => `${violation.code}:${violation.summary}`).join(","),
+        record.fdMatch ? `${record.fdMatch.level}:${record.fdMatch.kind}:${record.fdMatch.hasActive}:${record.fdMatch.notInDb}:${record.fdMatch.records.map(entry => `${entry.record.id}/${entry.sources.join("+")}/${entry.active}`).join(",")}` : "",
         record.matchedPreviousDeltaMs,
         record.matchedReasons.join(","),
         record.matchedContentSimilarity,
@@ -1216,7 +1183,7 @@ function applyHighlightToCard(element: HTMLElement, record: ThreadRecord) {
         element.style.removeProperty("border-color");
         element.style.removeProperty("border-style");
         element.style.removeProperty("border-width");
-        element.style.removeProperty("box-shadow");
+        applyFdOutline(element, record.fdMatch);
         applyViolationBadge(element, record);
         applyExpiryTooltip(element, record);
         return;
@@ -1233,7 +1200,7 @@ function applyHighlightToCard(element: HTMLElement, record: ThreadRecord) {
     element.style.removeProperty("border-color");
     element.style.removeProperty("border-style");
     element.style.removeProperty("border-width");
-    element.style.removeProperty("box-shadow");
+    applyFdOutline(element, record.fdMatch);
     applyViolationBadge(element, record);
     applyExpiryTooltip(element, record);
 
@@ -1365,6 +1332,32 @@ function injectBadgeStyles() {
     letter-spacing: 0.02em;
     pointer-events: none;
 }
+[data-vc-pl5-fd]::before {
+    content: attr(data-vc-pl5-fd);
+    position: absolute;
+    top: 6px;
+    left: 6px;
+    z-index: 100;
+    padding: 2px 6px;
+    border-radius: 4px;
+    background: rgba(185, 28, 28, 0.95);
+    color: #fff;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    pointer-events: none;
+}
+[data-vc-pl5-fd-kind="warning"]::before {
+    background: rgba(249, 115, 22, 0.95);
+    color: #2a1000;
+}
+[data-vc-pl5-fd-kind="past"]::before {
+    background: rgba(156, 163, 175, 0.95);
+    color: #111827;
+}
+[data-vc-pl5-fd-dim]::before {
+    opacity: 0.5;
+}
 `;
     document.head.appendChild(style);
 }
@@ -1420,65 +1413,34 @@ function detachHeartbeat() {
     }
 }
 
-function Driver() {
-    settings.use([
-        "enabled",
-        "warningDuplicateThresholdMinutes",
-        "duplicateWindowMinutes",
-        "excludePatternRegex",
-        "checkTitle",
-        "checkInvite",
-        "checkContent",
-        "similarityThreshold",
-        "showExpiryTooltip",
-        "tintUniquePosts",
-        "ruleMultipleInvites",
-        "ruleMissingTags",
-        "ruleTitleQuality",
-        "ruleUndisclosedAi",
-        "aiSignalThreshold",
-        "showViolationBadge",
-        "debugLogs",
-    ]);
+function isTargetForumThread(channelId: string | undefined) {
+    if (!channelId) return false;
 
-    useStateFromStores(
-        [ChannelStore, MessageStore, SelectedChannelStore],
-        () => {
-            const threads = ChannelStore.getAllThreadsForParent(FIXED_IDS.forumChannelId)
-                .filter((channel: any) => channel?.isForumPost?.() && channel.getGuildId() === FIXED_IDS.guildId);
-            const selected = SelectedChannelStore.getChannelId() ?? "";
-            return `${selected}|${threads.map((thread: any) => `${thread.id}:${thread.lastMessageId ?? ""}:${thread.messageCount ?? 0}:${MessageStore.getMessages(thread.id)?._array.length ?? 0}:${((thread as any).appliedTags ?? []).join(",")}`).join("|")}`;
-        },
-        null,
-        (oldValue: any, newValue: any) => oldValue === newValue
-    );
-
-    React.useEffect(() => {
-        logDebug("Driver effect scheduleRefresh()");
-        scheduleRefresh();
-    }, []);
-
-    return null;
+    const channel = ChannelStore.getChannel(channelId);
+    return channel?.parent_id === FIXED_IDS.forumChannelId && channel.getGuildId() === FIXED_IDS.guildId;
 }
 
-function mountDriver() {
-    if (typeof document === "undefined" || mountNode) return;
-
-    mountNode = document.createElement("div");
-    mountNode.id = "vc-pl5-post-duplicate-highlighter";
-    mountNode.style.display = "none";
-    document.body.appendChild(mountNode);
-
-    reactRoot = createRoot(mountNode);
-    reactRoot?.render(<Driver />);
+// Store changes reach us as Flux events rather than through a React component
+// subscribed with useStateFromStores: that selector re-ran on every MessageStore
+// change app-wide (every message in every channel) and rebuilt the whole forum's
+// signature string each time, while these handlers drop unrelated channels with a
+// single lookup. buildThreadRecords()' signature check still skips no-op rebuilds.
+function onForumDataChanged() {
+    if (!settings.store.enabled || !isInTargetForumContext()) return;
+    scheduleRefresh();
 }
 
-function unmountDriver() {
-    reactRoot?.unmount();
-    reactRoot = null;
-    mountNode?.remove();
-    mountNode = null;
+function onThreadEvent({ channel }: { channel?: { id?: string; parent_id?: string; }; }) {
+    if (channel?.parent_id !== FIXED_IDS.forumChannelId) return;
+    onForumDataChanged();
 }
+
+function onMessageEvent({ channelId, message }: { channelId?: string; message?: { channel_id?: string; }; }) {
+    if (!isTargetForumThread(channelId ?? message?.channel_id)) return;
+    onForumDataChanged();
+}
+
+const SETTINGS_PREFIX = "plugins.Pl5PostDuplicateHighlighter";
 
 function buildViolationNoticeContext(thread: any, record: ThreadRecord): ViolationNoticeContext {
     const firstMessage = getFirstForumMessage(thread.id);
@@ -1489,6 +1451,7 @@ function buildViolationNoticeContext(thread: any, record: ThreadRecord): Violati
         authorId: firstMessage?.author?.id ?? "",
         authorName: firstMessage?.author?.username ?? firstMessage?.author?.globalName ?? "",
         violations: cooldownViolation ? [cooldownViolation, ...record.violations] : record.violations,
+        fdMatch: record.fdMatch,
     };
 }
 
@@ -1520,7 +1483,7 @@ const patchThreadContextMenu: NavContextMenuPatchCallback = (children: any, { ch
     children.push(
         <Menu.MenuItem
             id="vc-pl5-copy-violation-text"
-            label={record.violations.length || record.highlight === "duplicate" ? "Copy violation notice…" : "Create violation notice…"}
+            label={record.violations.length || record.fdMatch || isDuplicateRecord(record) ? "Copy violation notice…" : "Create violation notice…"}
             action={() => openViolationTextModal(buildViolationNoticeContext(thread, record))}
         />
     );
@@ -1540,7 +1503,10 @@ export default definePlugin({
     start() {
         logDebug("start()");
         injectBadgeStyles();
-        mountDriver();
+        setRecordsChangeListener(scheduleRefresh);
+        // Every setting either changes what gets highlighted or how, so any change
+        // rescans (buildThreadRecords' signature check skips the no-op cases).
+        SettingsStore.addPrefixChangeListener(SETTINGS_PREFIX, scheduleRefresh);
         attachObserver();
         attachHeartbeat();
         scheduleRefresh();
@@ -1550,12 +1516,12 @@ export default definePlugin({
         logDebug("stop()");
         detachObserver();
         detachHeartbeat();
-        unmountDriver();
+        SettingsStore.removePrefixChangeListener(SETTINGS_PREFIX, scheduleRefresh);
 
         for (const element of document.querySelectorAll<HTMLElement>("[data-vc-pl5-post-duplicate-highlighter]")) {
             clearHighlightFromCard(element);
         }
-        for (const element of document.querySelectorAll<HTMLElement>("[data-vc-pl5-violations]")) {
+        for (const element of document.querySelectorAll<HTMLElement>("[data-vc-pl5-violations], [data-vc-pl5-fd]")) {
             removeViolationBadge(element);
         }
         removeBadgeStyles();
@@ -1569,6 +1535,8 @@ export default definePlugin({
         queuedOrFetchingMessageThreadIds.clear();
         activeMessageFetches = 0;
         similarityCache.clear();
+        fetchedFirstMessages.clear();
+        stopRecords();
         // duplicateHistory is intentionally left alone here (and persisted to
         // localStorage on every update) so the log survives a plugin restart
         // instead of resetting to empty every time the plugin is toggled/reloaded.
@@ -1581,11 +1549,21 @@ export default definePlugin({
             inputType: ApplicationCommandInputType.BUILT_IN,
             options: [],
             execute() {
-                openDuplicateHistoryModal();
+                openHistoryModal();
             },
         }
     ],
     contextMenus: {
         "thread-context": patchThreadContextMenu,
+    },
+
+    // Subscribed in start() and unsubscribed in stop() by Vencord.
+    flux: {
+        THREAD_CREATE: onThreadEvent,
+        THREAD_UPDATE: onThreadEvent,
+        THREAD_LIST_SYNC: onForumDataChanged,
+        MESSAGE_CREATE: onMessageEvent,
+        MESSAGE_UPDATE: onMessageEvent,
+        LOAD_MESSAGES_SUCCESS: onMessageEvent,
     },
 });

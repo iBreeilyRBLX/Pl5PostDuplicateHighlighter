@@ -13,8 +13,6 @@ export const FIXED_IDS = {
     // This is where "post for {faction name}" history actually lives, not
     // the ad forum channel itself.
     factionDiscussionChannelId: "594055247282831360",
-    // https://discord.com/api/v9/guilds/553917324340625424/messages/search?channel_id=594055247282831360&content=post%20for%20blackout%20pmc&sort_by=timestamp&sort_order=desc&offset=0
-    // https://discord.com/api/v9/channels/594055247282831360/messages/search?content=post%20for%20BLACKOUT%20PMC&include_nsfw=true
 } as const;
 
 export const COLORS = {
@@ -23,6 +21,9 @@ export const COLORS = {
     unique: 0x4ade80,
     violation: 0x00e5ff,
     official: 0xff69b4,
+    fdBlacklist: 0xdc2626,
+    fdWarning: 0xf97316,
+    fdPast: 0x9ca3af,
 } as const;
 
 export const LIMITS = {
@@ -37,6 +38,11 @@ export const LIMITS = {
         max: 1440,
     },
     similarityCacheMaxEntries: 4000,
+    // Characters of cleaned first-message content compared for "content" matches.
+    contentSnippetLength: 200,
+    // How far back (in duplicate windows) to look for the "nearest previous match"
+    // shown in the tooltip/history. Older posts can't affect the tint anyway.
+    duplicateLookbackWindows: 2,
     // Persisted duplicate-history log cap (survives plugin/Discord restarts). Larger
     // than the 40-50 entries shown in the panel/modal so older matches remain
     // available in localStorage even after they scroll out of the visible list.
@@ -47,6 +53,19 @@ export const LIMITS = {
     messageFetchRetry: {
         baseMs: 10_000,
         maxMs: 5 * 60_000,
+    },
+    // FD records API (pl5fd.com): public limit is 30 req/min per IP, so stay under it.
+    records: {
+        cacheTtlMs: 15 * 60_000,
+        cacheMaxEntries: 2000,
+        maxConcurrentRequests: 2,
+        // Discord invite resolves (FD confirmation + same-server duplicate matching).
+        maxConcurrentInviteResolves: 2,
+        requestsPerMinute: 25,
+        retry: {
+            baseMs: 15_000,
+            maxMs: 10 * 60_000,
+        },
     },
 } as const;
 
@@ -62,6 +81,7 @@ export const TIMING = {
 
 export const CACHE_KEYS = {
     duplicateHistory: "vc-pl5-duplicate-history-v1",
+    fdRecords: "vc-pl5-fd-records-v1",
 } as const;
 
 export const PATTERNS = {

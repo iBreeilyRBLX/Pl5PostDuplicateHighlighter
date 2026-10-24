@@ -18,7 +18,6 @@ import {
 import {
     Button,
     ChannelRouter,
-    ChannelStore,
     Checkbox,
     Forms,
     MessageActions,
@@ -28,11 +27,12 @@ import {
     Text,
     TextArea,
     TextInput,
-    Toasts,
 } from "@webpack/common";
 
 import { FIXED_IDS } from "./constants";
+import { describeFdLevel, type FdMatch, formatFdRecordLine, getEvidenceUrl, isBlacklistRecord } from "./records";
 import { C2_RULE_CATALOG, type RuleViolation } from "./rules";
+import { cleanFactionTitle } from "./text";
 import type { ViolationNoticeContext } from "./types";
 
 const PL5_EMOJI = "<:PL5:646268257384398848>";
@@ -52,27 +52,18 @@ function ruleCodesFromViolationCode(code: string): string[] {
     return code.split("/").map(part => (part.startsWith("C2-") ? part : `C2-${part}`));
 }
 
-// Builds the guideline text from whichever catalog checkboxes are selected,
-// preferring a matching auto-detected violation's specific summary (e.g. the
-// actual AI-signal list) over the catalog's generic rule text.
+// Builds the guideline text from whichever catalog checkboxes are selected, using
+// the official guideline wording. The one exception is C2-2, where the detected
+// violation's summary carries the actual cooldown timing ("Posting 3 hours early...").
 function buildGuidelinesText(selected: ReadonlySet<string>, detected: RuleViolation[]): string {
-    const usedDetected = new Set<RuleViolation>();
-    const lines: string[] = [];
+    const cooldown = detected.find(violation => violation.code === "C2-2");
 
-    for (const rule of C2_RULE_CATALOG) {
-        if (!selected.has(rule.code)) continue;
-        const match = detected.find(
-            violation => !usedDetected.has(violation) && ruleCodesFromViolationCode(violation.code).includes(rule.code)
-        );
-        if (match) {
-            usedDetected.add(match);
-            lines.push(`${match.code}: ${match.summary}`);
-        } else {
-            lines.push(`${rule.code}: ${rule.label}`);
-        }
-    }
-
-    return lines.join("\n");
+    return C2_RULE_CATALOG
+        .filter(rule => selected.has(rule.code))
+        .map(rule => rule.code === "C2-2" && cooldown
+            ? `${rule.code}: ${cooldown.summary}`
+            : `${rule.code}: ${rule.label}`)
+        .join("\n");
 }
 
 function initialSelectedCodes(violations: RuleViolation[]): Set<string> {
@@ -105,9 +96,7 @@ interface SearchResult {
 // retry/backoff machinery pl5ModScan uses for its many-query sweeps.
 async function searchFactionPosts(query: string, excludeThreadId: string): Promise<SearchResult> {
     const response = await RestAPI.get({
-        // https://discord.com/api/v9/guilds/553917324340625424/messages/search?channel_id=594055247282831360&content=post%20for%20blackout%20pmc&sort_by=timestamp&sort_order=desc&offset=0
-        // https://discord.com/api/v9/channels/594055247282831360/messages/search?content=post%20for%20BLACKOUT%20PMC&include_nsfw=true
-        url: "/guilds/553917324340625424/messages/search",
+        url: `/guilds/${FIXED_IDS.guildId}/messages/search`,
         query: { channel_id: FIXED_IDS.factionDiscussionChannelId, content: `post for ${query}`, include_nsfw: true },
     });
 
@@ -149,50 +138,140 @@ function buildWarningMessage(kind: WarningKind, ping: string, faction: string, g
     }
 }
 
+interface FdStanding {
+    // e.g. ["Blacklist (Permanent)", "Major Warning"] - active sanctions only
+    activeLabels: string[];
+    suggested: WarningKind | null;
+    reason: string;
+}
+
+// Summarizes the active FD sanctions on record and the next tier to escalate to.
+function getFdStanding(match: FdMatch | null): FdStanding | null {
+    if (!match?.records.length) return null;
+
+    const records = match.records.filter(entry => entry.active).map(entry => entry.record);
+    if (!records.length) return { activeLabels: [], suggested: null, reason: "nothing active, only past records" };
+
+    const status = (value: string | null) => (value ?? "").toLowerCase();
+    const blacklist = records.find(isBlacklistRecord);
+    const major = records.find(record => record.kind === "Warning" && status(record.status) === "major warning");
+    const minor = records.find(record => record.kind === "Warning" && status(record.status) === "minor warning");
+    const otherWarning = records.find(record => record.kind === "Warning" && record !== major && record !== minor);
+
+    const activeLabels = [
+        blacklist && `Blacklist${blacklist.status ? ` (${blacklist.status})` : ""}`,
+        major && "Major Warning",
+        minor && "Minor Warning",
+        otherWarning && (otherWarning.status ?? "Warning"),
+    ].filter(Boolean) as string[];
+
+    if (blacklist) return { activeLabels, suggested: "blacklist", reason: "already blacklisted" };
+    if (major) return { activeLabels, suggested: "blacklist", reason: "active major warning → escalate to blacklist" };
+    if (minor) return { activeLabels, suggested: "major", reason: "active minor warning → escalate to major warning" };
+    return { activeLabels, suggested: "minor", reason: "active warning on record → at least a minor warning" };
+}
+
+function formatExpiry(value: string | null) {
+    return value ? `, expires ${value.slice(0, 10)}` : "";
+}
+
+function FdRecordsSection({ match, standing }: { match: FdMatch; standing: FdStanding; }) {
+    const accent = !match.hasActive
+        ? "var(--text-muted)"
+        : match.kind === "blacklist" ? "var(--text-danger)" : "var(--text-warning)";
+
+    return (
+        <div style={{
+            borderRadius: 8,
+            padding: "10px 12px",
+            background: "var(--background-base-lower)",
+            borderLeft: `3px solid ${accent}`,
+        }}>
+            <Forms.FormTitle tag="h5" style={{ color: accent }}>
+                {standing.activeLabels.length
+                    ? `⚠ Active on FD record: ${standing.activeLabels.join(", ")}`
+                    : "FD record history (expired / appealed)"}
+            </Forms.FormTitle>
+            <Forms.FormText style={{ marginBottom: 8 }}>
+                {standing.suggested ? `Suggested: ${standing.reason}. ` : ""}Matched by {describeFdLevel(match)}
+                {match.level === "name" ? " - double-check it's the same faction." : "."}
+            </Forms.FormText>
+            <div style={{ display: "grid", gap: 6 }}>
+                {match.records.map(entry => {
+                    const evidenceUrl = getEvidenceUrl(entry.record);
+                    return (
+                        <div key={entry.record.id} style={entry.active ? undefined : { opacity: 0.7 }}>
+                            <Text variant="text-sm/normal">
+                                {formatFdRecordLine(entry)}{formatExpiry(entry.record.expirationDate)}
+                            </Text>
+                            {entry.record.description && (
+                                <Forms.FormText style={{ color: "var(--text-muted)" }}>{entry.record.description}</Forms.FormText>
+                            )}
+                            {evidenceUrl && (
+                                <a href={evidenceUrl} target="_blank" rel="noreferrer">Evidence</a>
+                            )}
+                        </div>
+                    );
+                })}
+            </div>
+        </div>
+    );
+}
+
 function ViolationNoticeModal(props: ModalProps & { context: ViolationNoticeContext; }) {
     const { context } = props;
 
     const [ping, setPing] = React.useState(context.authorId ? `<@${context.authorId}>` : "");
-    const [faction, setFaction] = React.useState(context.threadTitle ?? "");
+    // Start from the faction name inside the title (fonts, emoji and "| Now Recruiting"
+    // style taglines stripped) so the prior-warning search actually hits; mods can
+    // still edit it.
+    const [initialFaction] = React.useState(() => cleanFactionTitle(context.threadTitle ?? ""));
+    const [faction, setFaction] = React.useState(initialFaction);
     const [selectedCodes, setSelectedCodes] = React.useState(() => initialSelectedCodes(context.violations));
     const [guidelines, setGuidelines] = React.useState(() => buildGuidelinesText(selectedCodes, context.violations));
     const [preview, setPreview] = React.useState("");
     const [previewKind, setPreviewKind] = React.useState<WarningKind | null>(null);
+    const fdStanding = React.useMemo(() => getFdStanding(context.fdMatch), [context.fdMatch]);
 
     const [searching, setSearching] = React.useState(false);
     const [searchError, setSearchError] = React.useState<string | null>(null);
     const [searchResult, setSearchResult] = React.useState<SearchResult | null>(null);
+    // Incremented per search so a slow earlier response can't overwrite a newer one.
+    const searchRequestId = React.useRef(0);
 
     const handleCopy = React.useCallback((kind: WarningKind) => {
         const message = buildWarningMessage(kind, ping, faction, guidelines);
         setPreview(message);
         setPreviewKind(kind);
         copyToClipboard(message);
-        showToast(`Copied ${kind} warning to clipboard`, Toasts.Type.SUCCESS);
+        showToast({ text: `Copied ${kind} warning to clipboard`, variant: "success" });
     }, [ping, faction, guidelines]);
 
     const toggleRuleCode = React.useCallback((code: string) => {
-        setSelectedCodes(prev => {
-            const next = new Set(prev);
-            if (next.has(code)) next.delete(code); else next.add(code);
-            setGuidelines(buildGuidelinesText(next, context.violations));
-            return next;
-        });
-    }, [context.violations]);
+        // Computed outside the state updater: updaters must stay pure (React may call
+        // them twice), so the guidelines text is set alongside rather than from inside.
+        const next = new Set(selectedCodes);
+        if (next.has(code)) next.delete(code); else next.add(code);
+        setSelectedCodes(next);
+        setGuidelines(buildGuidelinesText(next, context.violations));
+    }, [selectedCodes, context.violations]);
 
-    const runFactionSearch = React.useCallback(async () => {
-        const query = faction.trim();
+    const runFactionSearch = React.useCallback(async (rawQuery: string) => {
+        const query = rawQuery.trim();
         if (!query) {
-            showToast("Enter a faction name first", Toasts.Type.FAILURE);
+            showToast({ text: "Enter a faction name first", variant: "critical" });
             return;
         }
 
+        const requestId = ++searchRequestId.current;
         setSearching(true);
         setSearchError(null);
         try {
             const result = await searchFactionPosts(query, context.threadId);
+            if (requestId !== searchRequestId.current) return;
             setSearchResult(result);
         } catch (error: any) {
+            if (requestId !== searchRequestId.current) return;
             const status = error?.status;
             setSearchError(
                 status === 403
@@ -201,20 +280,19 @@ function ViolationNoticeModal(props: ModalProps & { context: ViolationNoticeCont
             );
             setSearchResult(null);
         } finally {
-            setSearching(false);
+            if (requestId === searchRequestId.current) setSearching(false);
         }
-    }, [faction, context.threadId]);
+    }, [context.threadId]);
 
     // Auto-run the search once on open using the faction name we already have,
-    // so prior posts show up without an extra click. Further edits to the
-    // faction field just need the "Search" button.
+    // so prior posts show up without an extra click. Edits to the faction field
+    // don't search on their own - that's what the "Search again" button is for.
     React.useEffect(() => {
-        void runFactionSearch();
+        if (initialFaction.trim()) void runFactionSearch(initialFaction);
     }, []);
 
     const handleJumpToHit = React.useCallback((hit: SearchHit) => {
-        const channel = ChannelStore.getChannel(hit.channelId);
-        if (channel) ChannelRouter.transitionToThread(channel);
+        ChannelRouter.transitionToChannel(hit.channelId);
         MessageActions.jumpToMessage({ channelId: hit.channelId, messageId: hit.messageId, flash: true, jumpType: "INSTANT" });
     }, []);
 
@@ -228,11 +306,16 @@ function ViolationNoticeModal(props: ModalProps & { context: ViolationNoticeCont
             </ModalHeader>
 
             <ModalContent>
-                <div style={{ display: "grid", gap: 16, padding: "16px 0" }}>
+                {/* minmax(0, 1fr) columns: a plain grid column grows to its widest
+                    child, so one long nowrap search hit would widen the whole modal
+                    past its edge and push the checkboxes off-screen. */}
+                <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr)", gap: 16, padding: "16px 0" }}>
                     <Forms.FormText style={{ color: "var(--text-muted)" }}>
                         {context.threadTitle || context.threadId}
                         {context.authorName ? ` · posted by ${context.authorName}` : ""}
                     </Forms.FormText>
+
+                    {context.fdMatch && fdStanding && <FdRecordsSection match={context.fdMatch} standing={fdStanding} />}
 
                     <div>
                         <Forms.FormTitle tag="h5">Discord ID / ping</Forms.FormTitle>
@@ -260,7 +343,7 @@ function ViolationNoticeModal(props: ModalProps & { context: ViolationNoticeCont
                         </Forms.FormText>
                         <div style={{
                             display: "grid",
-                            gridTemplateColumns: "1fr 1fr",
+                            gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)",
                             gap: "4px 12px",
                         }}>
                             {C2_RULE_CATALOG.map(rule => (
@@ -308,7 +391,7 @@ function ViolationNoticeModal(props: ModalProps & { context: ViolationNoticeCont
                                 size={Button.Sizes.SMALL}
                                 color={Button.Colors.PRIMARY}
                                 disabled={searching}
-                                onClick={() => void runFactionSearch()}
+                                onClick={() => void runFactionSearch(faction)}
                             >
                                 {searching ? "Searching…" : "Search again"}
                             </Button>
@@ -318,7 +401,7 @@ function ViolationNoticeModal(props: ModalProps & { context: ViolationNoticeCont
                                 onClick={() => {
                                     const value = `in:#faction-discussion post for ${faction.trim() || "(Faction name)"}`;
                                     copyToClipboard(value);
-                                    showToast("Copied search query", Toasts.Type.SUCCESS);
+                                    showToast({ text: "Copied search query", variant: "success" });
                                 }}
                             >
                                 Copy query
@@ -337,7 +420,7 @@ function ViolationNoticeModal(props: ModalProps & { context: ViolationNoticeCont
                                     No prior posts found for "{faction.trim() || "(Faction name)"}".
                                 </Forms.FormText>
                             ) : (
-                                <div style={{ display: "grid", gap: 6, maxHeight: 220, overflowY: "auto" }}>
+                                <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr)", gap: 6, maxHeight: 220, overflowY: "auto" }}>
                                     <Forms.FormText style={{ color: "var(--text-muted)" }}>
                                         {searchResult.totalResults} match{searchResult.totalResults === 1 ? "" : "es"}
                                         {searchResult.hits.length < searchResult.totalResults ? ` (showing ${searchResult.hits.length})` : ""}:
@@ -389,10 +472,10 @@ function ViolationNoticeModal(props: ModalProps & { context: ViolationNoticeCont
                                 <Button
                                     key={kind}
                                     size={Button.Sizes.SMALL}
-                                    color={Button.Colors.PRIMARY}
+                                    color={fdStanding?.suggested === kind ? Button.Colors.RED : Button.Colors.PRIMARY}
                                     onClick={() => handleCopy(kind)}
                                 >
-                                    {label}
+                                    {label}{fdStanding?.suggested === kind ? " (suggested)" : ""}
                                 </Button>
                             ))}
                         </div>
@@ -413,8 +496,7 @@ function ViolationNoticeModal(props: ModalProps & { context: ViolationNoticeCont
                 <Button
                     color={Button.Colors.PRIMARY}
                     onClick={() => {
-                        const channel = ChannelStore.getChannel(context.threadId);
-                        if (channel) ChannelRouter.transitionToThread(channel);
+                        ChannelRouter.transitionToChannel(context.threadId);
                     }}
                 >
                     Jump to post
@@ -423,7 +505,7 @@ function ViolationNoticeModal(props: ModalProps & { context: ViolationNoticeCont
                     color={Button.Colors.PRIMARY}
                     onClick={() => {
                         copyToClipboard(`https://discord.com/channels/${FIXED_IDS.guildId}/${context.threadId}`);
-                        showToast("Copied post link", Toasts.Type.SUCCESS);
+                        showToast({ text: "Copied post link", variant: "success" });
                     }}
                 >
                     Copy post link
