@@ -37,7 +37,6 @@ export const LIMITS = {
         min: 1,
         max: 1440,
     },
-    similarityCacheMaxEntries: 4000,
     // Characters of cleaned first-message content compared for "content" matches.
     contentSnippetLength: 200,
     // How far back (in duplicate windows) to look for the "nearest previous match"

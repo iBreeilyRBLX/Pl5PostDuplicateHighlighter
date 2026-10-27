@@ -8,7 +8,7 @@ import { PluginNative } from "@utils/types";
 import { InviteActions } from "@webpack/common";
 
 import { CACHE_KEYS, LIMITS, LOG_PREFIX } from "./constants";
-import { levenshteinSimilarity } from "./similarity";
+import { levenshteinSimilarityAtLeast } from "./similarity";
 import { normalizeFactionName } from "./text";
 
 // FD sanction records (blacklists / warnings) from https://pl5fd.com/api/records.
@@ -321,7 +321,25 @@ function nameMatchesTitle(normalizedTitle: string, recordName: string) {
     if (` ${normalizedTitle} `.includes(` ${name} `)) return true;
     if (normalizedTitle.length >= 4 && ` ${name} `.includes(` ${normalizedTitle} `)) return true;
 
-    return levenshteinSimilarity(normalizedTitle, name) >= 0.85;
+    return levenshteinSimilarityAtLeast(normalizedTitle, name, 0.85) >= 0.85;
+}
+
+// getFdMatch() runs for every post on every rescan, and filtering name results means
+// normalizing and fuzzy-matching up to 50 record names per post. Cached per results
+// array, so a refreshed lookup (a new array) drops its stale filter results.
+const nameMatchCache = new WeakMap<FdRecord[], Map<string, FdRecord[]>>();
+
+function filterNameMatches(records: FdRecord[], normalizedTitle: string) {
+    let byTitle = nameMatchCache.get(records);
+    if (!byTitle) nameMatchCache.set(records, byTitle = new Map());
+
+    let matches = byTitle.get(normalizedTitle);
+    if (!matches) {
+        matches = records.filter(record => record.kind !== "User Violation" && nameMatchesTitle(normalizedTitle, record.primaryName));
+        byTitle.set(normalizedTitle, matches);
+    }
+
+    return matches;
 }
 
 export function isRecordActive(record: FdRecord, now = Date.now()) {
@@ -342,10 +360,8 @@ export function isBlacklistRecord(record: FdRecord) {
 
 export function getFdMatch(authorId: string, rawTitle: string, inviteCode: string, options: FdMatchOptions): FdMatch | null {
     const matched = new Map<string, FdMatchedRecord>();
-    const add = (records: FdRecord[] | undefined, source: FdMatchSource, filter?: (record: FdRecord) => boolean) => {
+    const add = (records: FdRecord[] | undefined, source: FdMatchSource) => {
         for (const record of records ?? []) {
-            if (filter && !filter(record)) continue;
-
             const existing = matched.get(record.id);
             if (existing) {
                 if (!existing.sources.includes(source)) existing.sources.push(source);
@@ -362,8 +378,8 @@ export function getFdMatch(authorId: string, rawTitle: string, inviteCode: strin
     if (options.checkTitle) {
         const query = titleSearchQuery(rawTitle);
         if (query) {
-            const normalizedTitle = normalizeFactionName(rawTitle);
-            add(lookup("name", query), "name", record => record.kind !== "User Violation" && nameMatchesTitle(normalizedTitle, record.primaryName));
+            const results = lookup("name", query);
+            if (results) add(filterNameMatches(results, normalizeFactionName(rawTitle)), "name");
         }
     }
 

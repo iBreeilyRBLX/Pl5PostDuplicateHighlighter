@@ -17,7 +17,7 @@ import { formatCooldownWindowLabel, formatDuration, formatDurationWords, formatM
 import { updateDuplicateHistory } from "./history";
 import { clearRecordsCache, describeFdLevel, type FdMatch, formatFdBadge, formatFdRecordLine, getFdMatch, getRecordsVersion, resolveInviteGuildId, setRecordsChangeListener, stopRecords } from "./records";
 import { checkRules, type RuleCheckOptions, type RuleViolation } from "./rules";
-import { levenshteinSimilarity } from "./similarity";
+import { levenshteinSimilarity, levenshteinSimilarityAtLeast } from "./similarity";
 import { normalizeContent, normalizeFactionName, normalizeTitle } from "./text";
 import type { DuplicateHistoryEntry, ForumCardMatch, MatchEvaluation, MatchReason, RecordSummary, ThreadRecord, ViolationNoticeContext } from "./types";
 import { openViolationTextModal } from "./ViolationModal";
@@ -204,7 +204,7 @@ let renderedRecords = new Map<string, ThreadRecord>();
 // cards while scrolling) re-triggers the observer and pays for a full rebuild even
 // though renderedRecords would come out identical.
 let lastRecordsSignature = "";
-const postTextCache = new Map<string, { firstMessageId: string; content: string; inviteCode: string; }>();
+const postTextCache = new Map<string, { firstMessageId: string; content: string; inviteCode: string; contentSnippet: string; }>();
 // checkRules() runs a dozen-plus regexes (title quality, invite counting, and
 // especially the C2-11 AI-signal detector) over full post content. Without this
 // cache it re-ran on every thread on every scan - every mutation-observer tick and
@@ -226,7 +226,14 @@ const fetchedFirstMessages = new Map<string, Message | null>();
 const messageFetchQueue: string[] = [];
 const queuedOrFetchingMessageThreadIds = new Set<string>();
 let activeMessageFetches = 0;
-const similarityCache = new Map<string, number>();
+// Content similarity per (post, earlier post) pair, keyed by thread ids and checked
+// against both snippets so it stays valid across rescans until a post's content
+// changes. A busy forum has tens of thousands of in-window pairs; the old flat cache
+// was capped far below that, so it thrashed and every rescan re-ran Levenshtein on
+// nearly every pair - the main cause of the forum freezing the client. Pruned to
+// live threads after each rebuild. `exact` is false when the check stopped early
+// because the pair was already below the threshold (similarity is then an upper bound).
+const similarityCache = new Map<string, Map<string, { left: string; right: string; similarity: number; exact: boolean; }>>();
 let excludeRegexCacheSource = "";
 let excludeRegexCache: RegExp | null = null;
 
@@ -557,31 +564,25 @@ function getPostText(channelId: string) {
         // staying empty until someone happens to open the thread. Skipped once a
         // fetch has shown the opening message was deleted.
         if (!fetchedFirstMessages.has(channelId)) scheduleFirstMessageFetch(channelId);
-        return { content: "", inviteCode: "" };
+        return { content: "", inviteCode: "", contentSnippet: "" };
     }
 
     const firstMessageKey = getFirstMessageKey(message);
     const cached = postTextCache.get(channelId);
     if (cached && cached.firstMessageId === firstMessageKey) {
-        return {
-            content: cached.content,
-            inviteCode: cached.inviteCode,
-        };
+        return cached;
     }
 
     const content = typeof message.content === "string" ? message.content : "";
-    const inviteCode = extractInviteCode(content);
-
-    postTextCache.set(channelId, {
+    const entry = {
         firstMessageId: firstMessageKey,
         content,
-        inviteCode,
-    });
-
-    return {
-        content,
-        inviteCode,
+        inviteCode: extractInviteCode(content),
+        contentSnippet: normalizeContent(content),
     };
+    postTextCache.set(channelId, entry);
+
+    return entry;
 }
 
 interface MatchOptions {
@@ -617,24 +618,33 @@ function evaluateMatch(left: ThreadRecord, right: ThreadRecord, options: MatchOp
         const lengthDelta = Math.abs(left.contentSnippet.length - right.contentSnippet.length);
         const maxLength = Math.max(left.contentSnippet.length, right.contentSnippet.length);
         if (!maxLength || lengthDelta / maxLength <= (1 - similarityThreshold)) {
-            const similarityCacheKey = `${left.threadId}|${right.threadId}|${left.contentSnippet}|${right.contentSnippet}`;
-            let similarity = similarityCache.get(similarityCacheKey);
-            if (similarity == null) {
-                similarity = levenshteinSimilarity(left.contentSnippet, right.contentSnippet);
-                if (similarityCache.size >= LIMITS.similarityCacheMaxEntries) {
-                    // Drop the oldest half (Map iteration is insertion order) rather
-                    // than everything, so the next scan doesn't recompute every pair.
-                    let toEvict = Math.floor(similarityCache.size / 2);
-                    for (const key of similarityCache.keys()) {
-                        if (toEvict-- <= 0) break;
-                        similarityCache.delete(key);
-                    }
-                }
-                similarityCache.set(similarityCacheKey, similarity);
+            // The score is only shown for pairs that matched on something; when nothing
+            // else matched, a bounded check that bails out below the threshold is enough.
+            const needExact = reasons.length > 0;
+            let byRight = similarityCache.get(left.threadId);
+            if (!byRight) similarityCache.set(left.threadId, byRight = new Map());
+
+            let cached = byRight.get(right.threadId);
+            if (
+                !cached
+                || cached.left !== left.contentSnippet
+                || cached.right !== right.contentSnippet
+                || (!cached.exact && (needExact || cached.similarity >= similarityThreshold))
+            ) {
+                const similarity = needExact
+                    ? levenshteinSimilarity(left.contentSnippet, right.contentSnippet)
+                    : levenshteinSimilarityAtLeast(left.contentSnippet, right.contentSnippet, similarityThreshold);
+                cached = {
+                    left: left.contentSnippet,
+                    right: right.contentSnippet,
+                    similarity,
+                    exact: needExact || similarity >= similarityThreshold,
+                };
+                byRight.set(right.threadId, cached);
             }
 
-            contentSimilarity = similarity;
-            if (similarity >= similarityThreshold) {
+            contentSimilarity = cached.similarity;
+            if (cached.similarity >= similarityThreshold) {
                 reasons.push("content");
             }
         }
@@ -852,8 +862,11 @@ function getFdMatchForThread(thread: any, inviteCode: string): FdMatch | null {
 
 function buildThreadRecords() {
     const windowMs = getDuplicateWindowMs();
-    const threads = getForumThreads()
-        .sort((left: any, right: any) => getThreadCreatedAt(left) - getThreadCreatedAt(right));
+    // createdAt is parsed once per thread rather than on every sort comparison.
+    const threads = getForumThreads();
+    const createdAtById = new Map<string, number>();
+    for (const thread of threads) createdAtById.set(thread.id, getThreadCreatedAt(thread));
+    threads.sort((left: any, right: any) => createdAtById.get(left.id)! - createdAtById.get(right.id)!);
 
     const signature = computeRecordsSignature(threads);
     if (signature === lastRecordsSignature) {
@@ -872,7 +885,7 @@ function buildThreadRecords() {
     const nextRecords = new Map<string, ThreadRecord>();
 
     for (const thread of threads) {
-        const createdAt = getThreadCreatedAt(thread);
+        const createdAt = createdAtById.get(thread.id)!;
         const cutoff = createdAt - windowMs;
 
         while (activeRecords.length && activeRecords[0].createdAt < cutoff) {
@@ -902,12 +915,12 @@ function buildThreadRecords() {
             fdMatch: null,
         };
 
-        const { content, inviteCode } = getPostText(thread.id);
+        const { content, inviteCode, contentSnippet } = getPostText(thread.id);
         record.inviteCode = inviteCode;
         if (inviteCode && settings.store.checkInvite && createdAt >= inviteResolveCutoff) {
             record.inviteGuildId = resolveInviteGuildId(inviteCode);
         }
-        record.contentSnippet = normalizeContent(content);
+        record.contentSnippet = contentSnippet;
         record.fdMatch = getFdMatchForThread(thread, inviteCode);
 
         const appliedTags = Array.isArray((thread as any).appliedTags)
@@ -954,6 +967,21 @@ function buildThreadRecords() {
     }
 
     renderedRecords = nextRecords;
+    // Drop pairs whose posts are gone or that fell out of the lookback, which
+    // getDuplicateInfo() never compares again.
+    const lookbackMs = windowMs * LIMITS.duplicateLookbackWindows;
+    for (const [threadId, byRight] of similarityCache) {
+        const left = nextRecords.get(threadId);
+        if (!left) {
+            similarityCache.delete(threadId);
+            continue;
+        }
+
+        for (const rightId of byRight.keys()) {
+            const right = nextRecords.get(rightId);
+            if (!right || right.createdAt < left.createdAt - lookbackMs) byRight.delete(rightId);
+        }
+    }
 
     const liveHistory: DuplicateHistoryEntry[] = [...nextRecords.values()]
         .filter(record => isDuplicateRecord(record) && record.matchedPreviousThreadId && record.matchedPreviousDeltaMs != null)
